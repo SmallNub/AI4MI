@@ -1,9 +1,34 @@
 # AI for medical imaging — Fall 2026 group project
 
+<!-- MarkdownTOC autolink="true" autoanchor="true" -->
+
+- [Project overview](#project-overview)
+- [Codebase features](#codebase-features)
+- [Codebase use](#codebase-use)
+    - [Setting up the environment](#setting-up-the-environment)
+        - [Setting up the environment - Some troubleshooting for windows users](#setting-up-the-environment---some-troubleshooting-for-windows-users)
+    - [Getting the data](#getting-the-data)
+    - [Viewing the data](#viewing-the-data)
+        - [2D viewer](#2d-viewer)
+        - [3D viewers](#3d-viewers)
+- [Submission and scoring](#submission-and-scoring)
+    - [Packing the code](#packing-the-code)
+    - [Saving the best model](#saving-the-best-model)
+    - [Archiving everything for submission](#archiving-everything-for-submission)
+- [Known issues](#known-issues)
+    - [Cannot pickle lambda in the dataloader](#cannot-pickle-lambda-in-the-dataloader)
+    - [Pytorch not compiled for Numpy 2.0](#pytorch-not-compiled-for-numpy-20)
+    - [Viewer on Windows](#viewer-on-windows)
+
+<!-- /MarkdownTOC -->
+
+
+<a id="project-overview"></a>
 ## Project overview
 The project is based around the SegTHOR challenge data, which was kindly allowed by Caroline Petitjean (challenge organizer) to use for the course. The challenge was originally on the segmentation of different organs: heart, aorta, esophagus and trachea.
 
 
+<a id="codebase-features"></a>
 ## Codebase features
 This codebase is given as a starting point, to provide an initial neural network that converges during training. (For broader context, this is itself a fork of an [older conference tutorial](https://github.com/LIVIAETS/miccai_weakly_supervised_tutorial) we gave few years ago.) It also provides facilities to locally run some test on a laptop, with a toy dataset and dummy network.
 
@@ -20,9 +45,11 @@ Summary of codebase (in PyTorch)
 
 **Some recurrent questions might be addressed here directly.** As such, it is expected that small change or additions to this readme to be made.
 
+<a id="codebase-use"></a>
 ## Codebase use
 In the following, a line starting by `$` usually means it is meant to be typed in the terminal (bash, zsh, fish, ...), whereas no symbol might indicate some python code.
 
+<a id="setting-up-the-environment"></a>
 ### Setting up the environment
 ```
 $ git clone https://github.com/HKervadec/ai4mi_project.git
@@ -40,6 +67,7 @@ $ python -m pip install -r requirements.txt
 ```
 Conda is an alternative to pip, but is recommended not to mix `conda install` and `pip install`.
 
+<a id="setting-up-the-environment---some-troubleshooting-for-windows-users"></a>
 #### Setting up the environment - Some troubleshooting for windows users
 These steps assume you are using Git Bash + Anaconda + an IDE (e.g., PyCharm).
 
@@ -91,6 +119,7 @@ fi
 ```
 You can also create new conda environment in anaconda prompt 
 
+<a id="getting-the-data"></a>
 ### Getting the data
 The synthetic dataset is generated randomly, whereas for Segthor it is required to put the file LINKS TO BE UPDATED (required a UvA account) in the `data/` folder. If the computer running it is powerful enough, the recipe for `data/SEGTHOR` can be modified in the [Makefile](Makefile) to enable multi-processing (`-p -1` option, see `python slice_segthor.py --help` or its code directly).
 ```
@@ -114,12 +143,14 @@ $ python  slice_segthor.py --source_dir data/segthor_train --dest_dir data/SEGTH
 $ mv data/SEGTHOR_tmp data/SEGTHOR
 ````
 
+<a id="viewing-the-data"></a>
 ### Viewing the data
 The data can be viewed in different ways:
 - looking directly at the `.png` in the sliced folder (`data/TOY2`, `data/SEGTHOR`);
 - using the provided "viewer" to compare segmentations ([see below](#viewing-the-results));
 - opening the Nifti files from `data/segthor_train` with [3D Slicer](https://www.slicer.org/) or [ITK Snap](http://www.itksnap.org).
 
+<a id="2d-viewer"></a>
 #### 2D viewer
 Comparing some predictions with the provided [viewer](viewer/viewer.py) (right-click to go to the next set of images, left-click to go back), or simply looking at the data:
 ```
@@ -140,6 +171,7 @@ $ python viewer/viewer.py --img_source data/SEGTHOR_CLEAN/val/img \
 ```
 ![Example of the viewer on the SEGTHOR pre-processed sets](viewer_segthor.png)
 
+<a id="3d-viewers"></a>
 #### 3D viewers
 [3D Slicer](https://www.slicer.org/) and [ITK Snap](http://www.itksnap.org) are two popular viewers for medical data, here comparing `GT.nii.gz` and the corresponding stitched prediction `Patient_01.nii.gz`:
 ![Viewing label and prediction](3dslicer.png)
@@ -148,6 +180,7 @@ Zooming on the prediction with smoothing disabled:
 ![Viewing the prediction without smoothing](3dslicer_zoom.png)
 
 
+<a id="submission-and-scoring"></a>
 ## Submission and scoring
 Groups will have to submit:
 * archive of the git repo with the whole project, which includes:
@@ -168,12 +201,15 @@ The main criterions for scoring will include (listed here only for convenience, 
 * oral presentation.
 
 
+<a id="packing-the-code"></a>
 ### Packing the code
 `$ git bundle create group-XX.bundle master`
 
+<a id="saving-the-best-model"></a>
 ### Saving the best model
 `torch.save(net, args.dest / "bestmodel-group-XX.pkl")`
 
+<a id="archiving-everything-for-submission"></a>
 ### Archiving everything for submission
 All files should be grouped in single folder with the following structure
 ```
@@ -209,12 +245,16 @@ Example using gunzip:
 $ tar cf group-XX.tar.gz - group-XX/
 ```
 
+<a id="known-issues"></a>
 ## Known issues
+<a id="cannot-pickle-lambda-in-the-dataloader"></a>
 ### Cannot pickle lambda in the dataloader
 Some installs (probably due to Python/Pytorch version mismatch) throw an error about an inability to pickle lambda functions (at the dataloader stage). Short of reinstalling everything, setting the number of workers to 0 seems to get around the problem (`--num_workers 0`).
 
+<a id="pytorch-not-compiled-for-numpy-20"></a>
 ### Pytorch not compiled for Numpy 2.0
 It may happen that Pytorch, when installed through pip, was compiled for Numpy 1.x, which creates some inconsistencies. Downgrading Numpy seems to solve it: `pip install --upgrade "numpy<2"`
 
+<a id="viewer-on-windows"></a>
 ### Viewer on Windows
 Windows has different paths names (`\` in stead of `/`), so the default regex in the viewer needs to be changed to `--id_regex=".*\\\\(.*).png"`.
