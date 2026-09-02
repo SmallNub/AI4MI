@@ -188,7 +188,7 @@ $ python viewer/viewer.py --img_source data/SEGTHOR/val/img \
     -n 2 -C 5 --remap "{63: 1, 126: 2, 189: 3, 252: 4}" \
     --legend --class_names background esophagus heart trachea aorta
 ```
-![Example of the viewer on SegTHOR](viewer_segthor.png)
+<!-- ![Example of the viewer on SegTHOR](viewer_segthor.png) -->
 
 <a id="3d-viewers"></a>
 #### 3D viewers
