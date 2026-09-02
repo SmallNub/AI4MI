@@ -8,9 +8,11 @@
     - [Setting up the environment](#setting-up-the-environment)
         - [Setting up the environment - Some troubleshooting for windows users](#setting-up-the-environment---some-troubleshooting-for-windows-users)
     - [Getting the data](#getting-the-data)
-    - [Viewing the data](#viewing-the-data)
+    - [Training a base network](#training-a-base-network)
+    - [Viewing the results](#viewing-the-results)
         - [2D viewer](#2d-viewer)
         - [3D viewers](#3d-viewers)
+    - [Plotting the metrics](#plotting-the-metrics)
 - [Submission and scoring](#submission-and-scoring)
     - [Packing the code](#packing-the-code)
     - [Saving the best model](#saving-the-best-model)
@@ -143,41 +145,88 @@ $ python  slice_segthor.py --source_dir data/segthor_train --dest_dir data/SEGTH
 $ mv data/SEGTHOR_tmp data/SEGTHOR
 ````
 
-<a id="viewing-the-data"></a>
-### Viewing the data
-The data can be viewed in different ways:
-- looking directly at the `.png` in the sliced folder (`data/TOY2`, `data/SEGTHOR`);
-- using the provided "viewer" to compare segmentations ([see below](#viewing-the-results));
-- opening the Nifti files from `data/segthor_train` with [3D Slicer](https://www.slicer.org/) or [ITK Snap](http://www.itksnap.org).
+<a id="training-a-base-network"></a>
+### Training a base network
+Running a training
+```
+$ python main.py --help
+usage: main.py [-h] [--epochs EPOCHS] [--dataset {TOY2,SEGTHOR}] [--mode {partial,full}] --dest DEST [--gpu] [--debug]
 
+options:
+  -h, --help            show this help message and exit
+  --epochs EPOCHS
+  --dataset {TOY2,SEGTHOR}
+  --mode {partial,full}
+  --dest DEST           Destination directory to save the results (predictions and weights).
+  --gpu
+  --debug               Keep only a fraction (10 samples) of the datasets, to test the logic around epochs and logging easily.
+$ python main.py --dataset TOY2 --mode full --epoch 25 --dest results/toy2/ce --gpu
+```
+
+The codebase uses a lot of assertions for control and self-documentation, they can easily be disabled with the `-O` option (for faster training) once everything is known to be correct (for instance run the previous command for 1/2 epochs, then kill it and relaunch it):
+```
+$ python -O main.py --dataset TOY2 --mode full --epoch 25 --dest results/toy2/ce --gpu
+```
+
+<a id="viewing-the-results"></a>
+### Viewing the results
 <a id="2d-viewer"></a>
 #### 2D viewer
-Comparing some predictions with the provided [viewer](viewer/viewer.py) (right-click to go to the next set of images, left-click to go back), or simply looking at the data:
+Comparing some predictions with the provided [viewer](viewer/viewer.py) (right-click to go to the next set of images, left-click to go back):
 ```
 $ python viewer/viewer.py --img_source data/TOY2/val/img \
-    data/TOY2/val/gt \
+    data/TOY2/val/gt results/toy2/ce/iter000/val results/toy2/ce/iter005/val results/toy2/ce/best_epoch/val \
     --show_img -C 256 --no_contour
 ```
 ![Example of the viewer on the TOY example](viewer_toy.png)
 **Note:** if using it from a SSH session, it requires X to be forwarded ([Unix/BSD](https://man.archlinux.org/man/ssh.1#X), [Windows](https://mobaxterm.mobatek.net/documentation.html#1_4)) for it to work. Note that X forwarding also needs to be enabled on the server side.
 
 
-For Segthor, comparing for instance the original data, the fixed ones, and the validation predictions at epoch 10:
 ```
-$ python viewer/viewer.py --img_source data/SEGTHOR_CLEAN/val/img \
-    data/SEGTHOR/val/gt data/SEGTHOR_CLEAN/val/gt results/segthor/ce/iter010/val \
+$ python viewer/viewer.py --img_source data/SEGTHOR/val/img \
+    data/SEGTHOR/val/gt results/segthor/ce/iter000/val results/segthor/ce/best_epoch/val \
     -n 2 -C 5 --remap "{63: 1, 126: 2, 189: 3, 252: 4}" \
     --legend --class_names background esophagus heart trachea aorta
 ```
-![Example of the viewer on the SEGTHOR pre-processed sets](viewer_segthor.png)
+![Example of the viewer on SegTHOR](viewer_segthor.png)
 
 <a id="3d-viewers"></a>
 #### 3D viewers
+To look at the results in 3D, it is necessary to reconstruct the 3D volume from the individual 2D predictions saved as images.
+To stitch the `.png` back to a nifti file:
+```
+$ python stitch.py --data_folder results/segthor/ce/best_epoch/val \
+    --dest_folder volumes/segthor/ce \
+    --num_classes 255 --grp_regex "(Patient_\d\d)_\d\d\d\d" \
+    --source_scan_pattern "data/segthor_train/train/{id_}/GT.nii.gz"
+```
+
 [3D Slicer](https://www.slicer.org/) and [ITK Snap](http://www.itksnap.org) are two popular viewers for medical data, here comparing `GT.nii.gz` and the corresponding stitched prediction `Patient_01.nii.gz`:
 ![Viewing label and prediction](3dslicer.png)
 
 Zooming on the prediction with smoothing disabled:
 ![Viewing the prediction without smoothing](3dslicer_zoom.png)
+
+
+<a id="plotting-the-metrics"></a>
+### Plotting the metrics
+There are some facilities to plot the metrics saved by [`main.py`](main.py):
+```
+$ python plot.py --help
+usage: plot.py [-h] --metric_file METRIC_MODE.npy [--dest METRIC_MODE.png] [--headless]
+
+Plot data over time
+
+options:
+  -h, --help            show this help message and exit
+  --metric_file METRIC_MODE.npy
+                        The metric file to plot.
+  --dest METRIC_MODE.png
+                        Optional: save the plot to a .png file
+  --headless            Does not display the plot and save it directly (implies --dest to be provided.
+$ python plot.py --metric_file results/segthor/ce/dice_val.npy --dest results/segthor/ce/dice_val.png
+```
+![Validation DSC](dice_val.png)
 
 
 <a id="submission-and-scoring"></a>

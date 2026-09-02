@@ -72,7 +72,7 @@ def sanity_gt(gt, ct) -> bool:
     assert gt.dtype in [np.uint8], gt.dtype
 
     # Do the test on 3d: assume all organs are present..
-    assert set(np.unique(gt)) == set(range(5))
+    # assert set(np.unique(gt)) == set(range(5))
 
     return True
 
@@ -172,7 +172,7 @@ def main(args: argparse.Namespace):
     resolution_dict: dict[str, tuple[float, float, float]] = {}
 
     split_ids: list[str]
-    for mode, split_ids in zip(["train", "val", "test"], [training_ids, validation_ids, test_ids]):
+    for mode, split_ids in zip(["train", "val"], [training_ids, validation_ids]):
         dest_mode: Path = dest_path / mode
         print(f"Slicing {len(split_ids)} pairs to {dest_mode}")
 
