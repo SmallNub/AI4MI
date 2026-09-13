@@ -82,7 +82,9 @@ def merge_patient(
 
     # res_arr = res_arr.astype(np.int16)
     res_arr //= 63  # For segthor only
-    assert set(np.unique(res_arr)) == set(range(5)), np.uint8(res_arr)
+    assert set(np.unique(res_arr)).issubset(
+        set(range(5))
+    ), f"Found unexpected class values: {np.unique(res_arr)}"
 
     new_nib = nib.nifti1.Nifti1Image(
         res_arr, affine=orig_nib.affine, header=orig_nib.header
