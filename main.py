@@ -63,6 +63,10 @@ models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
 models_params["ENet"] = {"net": ENet, "args": {"kernels": 8, "factor": 2}}
 
+optimizer_params: dict[str, dict[str, Any]] = {}
+optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999)}}
+optimizer_params["sgd"] = {"optim": torch.optim.SGD, "args": {}}
+
 
 def img_transform(img):
     img = img.convert("L")
@@ -97,8 +101,9 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     net.init_weights()
     net.to(device)
 
-    lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    optimizer = optimizer_params[args.optim]["optim"](
+        net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
+    )
 
     # Dataset part
     B: int = datasets_params[args.dataset]["B"]
@@ -191,7 +196,7 @@ def runTraining(args):
 
                     # Metrics computation, not used for training
                     pred_seg = probs2one_hot(pred_probs)
-                    log_dice[e, j:j + B, :] = dice_coef(
+                    log_dice[e, j: j + B, :] = dice_coef(
                         pred_seg, gt
                     )  # One DSC value per sample and per class
 
@@ -257,6 +262,8 @@ def main():
     parser.add_argument("--epochs", default=20, type=int)
     parser.add_argument("--dataset", default="TOY2", choices=datasets_params.keys())
     parser.add_argument("--model", default="shallowCNN", choices=models_params.keys())
+    parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
+    parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
     parser.add_argument(
         "--dest",
