@@ -90,11 +90,18 @@ def gt_transform(K, img):
     return img[0]
 
 
-def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
-    # Networks and scheduler
+def setup(args) -> tuple[nn.Module, Any, torch.device, DataLoader, DataLoader, int]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
+
+    if gpu:
+        if args.tf32:
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.allow_tf32 = True
+            print(">> Enabled TF32 precision")
+
+        torch.backends.cudnn.benchmark = True
 
     K: int = datasets_params[args.dataset]["K"]
     net = models_params[args.model]["net"](1, K, **models_params[args.model]["args"])
@@ -116,7 +123,13 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
     )
-    train_loader = DataLoader(train_set, batch_size=B, num_workers=5, shuffle=True)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=B,
+        num_workers=5,
+        shuffle=True,
+        pin_memory=gpu,
+    )
 
     val_set = SliceDataset(
         "val",
@@ -125,7 +138,13 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
     )
-    val_loader = DataLoader(val_set, batch_size=B, num_workers=5, shuffle=False)
+    val_loader = DataLoader(
+        val_set,
+        batch_size=B,
+        num_workers=5,
+        shuffle=False,
+        pin_memory=gpu,
+    )
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
@@ -144,6 +163,13 @@ def runTraining(args):
         loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
     else:
         raise ValueError(args.mode, args.dataset)
+
+    amp_enabled: bool = args.amp != "none" and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
+
+    scaler = torch.amp.GradScaler(device.type, enabled=(amp_enabled and args.amp == "fp16"))
+
+    print(f">> Mixed Precision (AMP): {args.amp.upper()} (Enabled: {amp_enabled})")
 
     # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
@@ -173,41 +199,45 @@ def runTraining(args):
                     log_loss = log_loss_val
                     log_dice = log_dice_val
 
-            with (
-                cm()
-            ):  # Either dummy context manager, or the torch.no_grad for validation
+            with cm():  # Either dummy context manager, or torch.no_grad for validation
                 j = 0
                 tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
                 for i, data in tq_iter:
-                    img = data["images"].to(device)
-                    gt = data["gts"].to(device)
+                    img = data["images"].to(device, non_blocking=True)
+                    gt = data["gts"].to(device, non_blocking=True)
 
                     if opt:  # So only for training
-                        opt.zero_grad()
+                        opt.zero_grad(set_to_none=True)
 
                     # Sanity tests to see we loaded and encoded the data correctly
                     assert 0 <= img.min() and img.max() <= 1
                     B, _, W, H = img.shape
 
-                    pred_logits = net(img)
-                    pred_probs = F.softmax(
-                        1 * pred_logits, dim=1
-                    )  # 1 is the temperature parameter
+                    # Forward pass wrapped in torch.autocast context
+                    with torch.autocast(
+                        device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
+                    ):
+                        pred_logits = net(img)
+                        pred_probs = F.softmax(
+                            1 * pred_logits, dim=1
+                        )  # 1 is the temperature parameter
+                        loss = loss_fn(pred_probs, gt)
 
-                    # Metrics computation, not used for training
-                    pred_seg = probs2one_hot(pred_probs)
-                    log_dice[e, j: j + B, :] = dice_coef(
-                        pred_seg, gt
-                    )  # One DSC value per sample and per class
+                    # Metrics computation (casting to float32 for metric stability)
+                    with torch.no_grad():
+                        pred_seg = probs2one_hot(pred_probs)
+                        log_dice[e, j : j + B, :] = dice_coef(
+                            pred_seg, gt
+                        )  # One DSC value per sample and per class
 
-                    loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = (
                         loss.item()
                     )  # One loss value per batch (averaged in the loss)
 
                     if opt:  # Only for training
-                        loss.backward()
-                        opt.step()
+                        scaler.scale(loss).backward()
+                        scaler.step(opt)
+                        scaler.update()
 
                     if m == "val":
                         with warnings.catch_warnings():
@@ -233,7 +263,7 @@ def runTraining(args):
                         }
                     tq_iter.set_postfix(postfix_dict)
 
-        # I save it at each epochs, in case the code crashes or I decide to stop it early
+        # Save results at each epoch
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
@@ -260,8 +290,8 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--epochs", default=20, type=int)
-    parser.add_argument("--dataset", default="TOY2", choices=datasets_params.keys())
-    parser.add_argument("--model", default="shallowCNN", choices=models_params.keys())
+    parser.add_argument("--dataset", default="SEGTHOR", choices=datasets_params.keys())
+    parser.add_argument("--model", default="ENet", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
@@ -273,6 +303,19 @@ def main():
     )
 
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument(
+        "--amp",
+        default="bf16",
+        choices=["none", "fp16", "bf16"],
+        help="Automatic Mixed Precision mode (default: bf16).",
+    )
+    parser.add_argument(
+        "--no-tf32",
+        dest="tf32",
+        default=True,
+        action="store_false",
+        help="Disable TensorFloat-32 (TF32) execution precision.",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
