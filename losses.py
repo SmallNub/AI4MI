@@ -23,7 +23,7 @@
 # SOFTWARE.
 
 
-from torch import einsum
+from torch import Tensor, einsum
 
 from utils import simplex, sset
 
@@ -51,3 +51,52 @@ class CrossEntropy:
 class PartialCrossEntropy(CrossEntropy):
     def __init__(self, **kwargs):
         super().__init__(idk=[1], **kwargs)
+
+
+class GeneralizedDice:
+    def __init__(self, **kwargs):
+        self.idk = kwargs["idk"]
+        self.eps = kwargs.get("eps", 1e-6)
+        print(f"Initialized {self.__class__.__name__} with {kwargs}")
+
+    def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
+        assert pred_softmax.shape == weak_target.shape
+        assert simplex(pred_softmax)
+        assert sset(weak_target, [0, 1])
+
+        p = pred_softmax[:, self.idk, ...]
+        t = weak_target[:, self.idk, ...].float()
+
+        # Class weights: w_k = 1 / (|Y_k|^2 + eps)
+        # Sum over spatial dimensions (w, h)
+        volumes = einsum("bkwh->bk", t)
+        weights = 1.0 / (volumes**2 + self.eps)
+
+        # Weighted intersection and union/cardinality per batch item
+        intersection = einsum("bkwh,bkwh->bk", p, t)
+        cardinality = einsum("bkwh->bk", p) + volumes
+
+        gdl_num = einsum("bk,bk->b", weights, intersection)
+        gdl_den = einsum("bk,bk->b", weights, cardinality) + self.eps
+
+        gdl_score = 2.0 * gdl_num / gdl_den
+        return (1.0 - gdl_score).mean()
+
+
+class CompoundLoss:
+    def __init__(self, **kwargs):
+        self.ce_weight = kwargs.get("ce_weight", 0.5)
+        self.dice_weight = kwargs.get("dice_weight", 0.5)
+
+        self.ce = CrossEntropy(**kwargs)
+        self.gdl = GeneralizedDice(**kwargs)
+
+        print(
+            f"Initialized {self.__class__.__name__} with CE weight={self.ce_weight}, Dice weight={self.dice_weight}"
+        )
+
+    def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
+        ce_val = self.ce(pred_softmax, weak_target)
+        gdl_val = self.gdl(pred_softmax, weak_target)
+
+        return self.ce_weight * ce_val + self.dice_weight * gdl_val

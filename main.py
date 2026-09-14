@@ -50,7 +50,7 @@ from utils import (
     save_images,
 )
 
-from losses import CrossEntropy
+from losses import CrossEntropy, GeneralizedDice, CompoundLoss
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -90,7 +90,7 @@ def gt_transform(K, img):
     return img[0]
 
 
-def setup(args) -> tuple[nn.Module, Any, torch.device, DataLoader, DataLoader, int]:
+def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoader, int]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
@@ -110,6 +110,12 @@ def setup(args) -> tuple[nn.Module, Any, torch.device, DataLoader, DataLoader, i
 
     optimizer = optimizer_params[args.optim]["optim"](
         net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=1e-6,
     )
 
     # Dataset part
@@ -148,21 +154,32 @@ def setup(args) -> tuple[nn.Module, Any, torch.device, DataLoader, DataLoader, i
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    return (net, optimizer, device, train_loader, val_loader, K)
+    return (net, optimizer, scheduler, device, train_loader, val_loader, K)
 
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K = setup(args)
+    net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
 
     if args.mode == "full":
-        loss_fn = CrossEntropy(
-            idk=list(range(K))
-        )  # Supervise both background and foreground
+        supervised_ids = list(range(K))  # Supervise both background and foreground
     elif args.mode in ["partial"] and args.dataset == "SEGTHOR":
-        loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        supervised_ids = [0, 1, 3, 4]  # Do not supervise the heart (class 2)
     else:
         raise ValueError(args.mode, args.dataset)
+
+    loss_kwargs = {
+        "idk": supervised_ids,
+        "ce_weight": args.ce_weight,
+        "dice_weight": args.dice_weight,
+    }
+
+    if args.loss == "ce":
+        loss_fn = CrossEntropy(**loss_kwargs)
+    elif args.loss == "gdl":
+        loss_fn = GeneralizedDice(**loss_kwargs)
+    elif args.loss == "compound":
+        loss_fn = CompoundLoss(**loss_kwargs)
 
     amp_enabled: bool = args.amp != "none" and device.type == "cuda"
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
@@ -263,6 +280,8 @@ def runTraining(args):
                         }
                     tq_iter.set_postfix(postfix_dict)
 
+        scheduler.step()
+
         # Save results at each epoch
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
@@ -270,6 +289,8 @@ def runTraining(args):
         np.save(args.dest / "dice_val.npy", log_dice_val)
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
+        print(f">> LR: {scheduler.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}")
+
         if current_dice > best_dice:
             message = f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
             print(message)
@@ -294,6 +315,24 @@ def main():
     parser.add_argument("--model", default="ENet", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)
+    parser.add_argument(
+        "--loss",
+        default="ce",
+        choices=["ce", "gdl", "compound"],
+        help="Loss function to use: 'ce', 'gdl', or 'compound' (weighted mix).",
+    )
+    parser.add_argument(
+        "--ce-weight",
+        default=0.5,
+        type=float,
+        help="Weight for Cross Entropy when using compound loss.",
+    )
+    parser.add_argument(
+        "--dice-weight",
+        default=0.5,
+        type=float,
+        help="Weight for Generalized Dice when using compound loss.",
+    )
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
     parser.add_argument(
         "--dest",
