@@ -180,6 +180,68 @@ class BottleNeckUpSampling(nn.Module):
         return output
 
 
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(channels // reduction, 1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.gate = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, input: Tensor) -> Tensor:
+        batch, channels, _, _ = input.shape
+        weights = self.gate(self.pool(input).view(batch, channels))
+        return input * weights.view(batch, channels, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        self.gate = nn.Conv2d(
+            2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False
+        )
+        self.activation = nn.Sigmoid()
+
+    def forward(self, input: Tensor) -> Tensor:
+        average = input.mean(dim=1, keepdim=True)
+        maximum = input.amax(dim=1, keepdim=True)
+        weights = self.activation(self.gate(torch.cat((average, maximum), dim=1)))
+        return input * weights
+
+
+def _enet_features(
+    net: "ENet", input: Tensor
+) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor, Tensor]]:
+    conv_0 = net.conv0(input)
+    maxpool_0 = net.maxpool0(input)
+    output_initial = torch.cat((conv_0, maxpool_0), dim=1)
+
+    bn1_0, indices_1 = net.bottleneck1_0(output_initial)
+    bn1_out = net.bottleneck1_1(bn1_0)
+    bn2_0, indices_2 = net.bottleneck2_0(bn1_out)
+    bn2_out = net.bottleneck2_1(bn2_0)
+
+    return output_initial, bn1_out, bn2_out, (indices_1, indices_2)
+
+
+def _enet_decode(
+    net: "ENet",
+    output_initial: Tensor,
+    bn1_out: Tensor,
+    bn3_out: Tensor,
+    indices: tuple[Tensor, Tensor],
+) -> Tensor:
+    indices_1, indices_2 = indices
+    bn4_out = net.bottleneck4((bn3_out, indices_2, bn1_out))
+    bn5_out = net.bottleneck5((bn4_out, indices_1, output_initial))
+    interpolated = F.interpolate(bn5_out, mode="nearest", scale_factor=2)
+    return net.final(interpolated)
+
+
 class ENet(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, **kwargs):
         super().__init__()
@@ -273,3 +335,76 @@ class ENet(nn.Module):
 
     def init_weights(self, *args, **kwargs):
         self.apply(random_weights_init)
+
+
+class AttentionENet(ENet):
+    """ENet with channel attention at the bottleneck feature scale."""
+
+    def __init__(self, in_dim: int, out_dim: int, **kwargs):
+        super().__init__(in_dim, out_dim, **kwargs)
+        kernels = kwargs["kernels"] if "kernels" in kwargs else 16
+        self.attention_down = ChannelAttention(kernels * 8)
+        self.attention_middle = ChannelAttention(kernels * 4)
+
+    def forward(self, input: Tensor) -> Tensor:
+        output_initial, bn1_out, bn2_out, indices = _enet_features(self, input)
+        bn2_out = self.attention_down(bn2_out)
+        bn3_out = self.bottleneck3(bn2_out)
+        bn3_out = self.attention_middle(bn3_out)
+        return _enet_decode(
+            self,
+            output_initial,
+            bn1_out,
+            bn3_out,
+            indices,
+        )
+
+    def init_weights(self, *args, **kwargs):
+        super().init_weights(*args, **kwargs)
+        for module in (self.attention_down, self.attention_middle):
+            for layer in module.gate:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+
+
+class SpatialENet(ENet):
+    """ENet with spatial attention at the bottleneck feature scale."""
+
+    def __init__(self, in_dim: int, out_dim: int, **kwargs):
+        super().__init__(in_dim, out_dim, **kwargs)
+        kernels = kwargs["kernels"] if "kernels" in kwargs else 16
+        self.attention_down = SpatialAttention()
+        self.attention_middle = SpatialAttention()
+        self.channels_down = kernels * 8
+        self.channels_middle = kernels * 4
+
+    def forward(self, input: Tensor) -> Tensor:
+        output_initial, bn1_out, bn2_out, indices = _enet_features(self, input)
+        bn2_out = self.attention_down(bn2_out)
+        bn3_out = self.attention_middle(self.bottleneck3(bn2_out))
+        return _enet_decode(
+            self,
+            output_initial,
+            bn1_out,
+            bn3_out,
+            indices,
+        )
+
+
+class CBAMENet(AttentionENet):
+    """ENet with channel and spatial attention at the bottleneck scale."""
+
+    def __init__(self, in_dim: int, out_dim: int, **kwargs):
+        super().__init__(in_dim, out_dim, **kwargs)
+        self.spatial_down = SpatialAttention()
+        self.spatial_middle = SpatialAttention()
+
+    def forward(self, input: Tensor) -> Tensor:
+        output_initial, bn1_out, bn2_out, indices = _enet_features(self, input)
+        refined = self.attention_down(bn2_out)
+        refined = self.spatial_down(refined)
+        refined = self.bottleneck3(refined)
+        refined = self.attention_middle(refined)
+        refined = self.spatial_middle(refined)
+        return _enet_decode(self, output_initial, bn1_out, refined, indices)

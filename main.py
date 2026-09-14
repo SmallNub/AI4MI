@@ -44,7 +44,7 @@ from functools import partial
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
-from ENet import ENet
+from ENet import ENet, AttentionENet, SpatialENet, CBAMENet
 from utils import (
     Dcm,
     class2one_hot,
@@ -69,6 +69,18 @@ datasets_params["SEGTHOR_CLEAN"] = {"K": 5, "B": 8}
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
 models_params["ENet"] = {"net": ENet, "args": {"kernels": 8, "factor": 2}}
+models_params["AttentionENet"] = {
+    "net": AttentionENet,
+    "args": {"kernels": 8, "factor": 2},
+}
+models_params["SpatialENet"] = {
+    "net": SpatialENet,
+    "args": {"kernels": 8, "factor": 2},
+}
+models_params["CBAMENet"] = {
+    "net": CBAMENet,
+    "args": {"kernels": 8, "factor": 2},
+}
 
 optimizer_params: dict[str, dict[str, Any]] = {}
 optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999)}}
