@@ -445,8 +445,17 @@ def main() -> None:
 
     if args.csv_out:
         args.csv_out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(args.csv_out, index=False)
-        print(f"\nDetailed results saved to {args.csv_out}")
+
+        summary_rows = summary.copy()
+        summary_rows.insert(0, "patient", "MEAN")
+
+        combined = pd.concat(
+            [df, summary_rows],
+            ignore_index=True,
+        )
+
+        combined.to_csv(args.csv_out, index=False)
+        print(f"\nDetailed and mean metrics saved to {args.csv_out}")
 
 
 if __name__ == "__main__":
