@@ -34,6 +34,11 @@ import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 
 from functools import partial
 
@@ -108,15 +113,37 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
     net.init_weights()
     net.to(device)
 
+    if getattr(args, "compile", False):
+        if hasattr(torch, "compile"):
+            print(">> Compiling model with torch.compile()...")
+            net = torch.compile(net)
+        else:
+            print(">> Warning: torch.compile is not supported on this PyTorch version.")
+
     optimizer = optimizer_params[args.optim]["optim"](
         net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=1e-6,
-    )
+    warmup_epochs = getattr(args, "warmup_epochs", 5)
+
+    if warmup_epochs > 0 and args.epochs > warmup_epochs:
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=0.01, total_iters=warmup_epochs
+        )
+
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, T_max=(args.epochs - warmup_epochs), eta_min=1e-6
+        )
+
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
 
     # Dataset part
     B: int = datasets_params[args.dataset]["B"]
@@ -135,6 +162,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         num_workers=5,
         shuffle=True,
         pin_memory=gpu,
+        drop_last=True,
     )
 
     val_set = SliceDataset(
@@ -178,8 +206,12 @@ def runTraining(args):
         loss_fn = CrossEntropy(**loss_kwargs)
     elif args.loss == "gdl":
         loss_fn = GeneralizedDice(**loss_kwargs)
+        raise ValueError(">>> Using GeneralizedDice alone is not supported")
     elif args.loss == "compound":
         loss_fn = CompoundLoss(**loss_kwargs)
+
+    if args.compile and hasattr(torch, "compile"):
+        loss_fn = torch.compile(loss_fn)
 
     amp_enabled: bool = args.amp != "none" and device.type == "cuda"
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
@@ -253,6 +285,13 @@ def runTraining(args):
 
                     if opt:  # Only for training
                         scaler.scale(loss).backward()
+
+                        if args.clip_grad > 0:
+                            scaler.unscale_(opt)
+                            torch.nn.utils.clip_grad_norm_(
+                                net.parameters(), max_norm=args.clip_grad
+                            )
+
                         scaler.step(opt)
                         scaler.update()
 
@@ -303,8 +342,9 @@ def runTraining(args):
                 rmtree(best_folder)
             copytree(args.dest / f"iter{e:03d}", Path(best_folder))
 
-            torch.save(net, args.dest / "bestmodel.pkl")
-            torch.save(net.state_dict(), args.dest / "bestweights.pt")
+            model_to_save = getattr(net, "_orig_mod", net)
+            torch.save(model_to_save, args.dest / "bestmodel.pkl")
+            torch.save(model_to_save.state_dict(), args.dest / "bestweights.pt")
 
 
 def main():
@@ -315,6 +355,12 @@ def main():
     parser.add_argument("--model", default="ENet", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)
+    parser.add_argument(
+        "--warmup-epochs",
+        default=5,
+        type=int,
+        help="Number of initial epochs for linear learning rate warmup (default: 5). Set to 0 to disable.",
+    )
     parser.add_argument(
         "--loss",
         default="ce",
@@ -333,6 +379,12 @@ def main():
         type=float,
         help="Weight for Generalized Dice when using compound loss.",
     )
+    parser.add_argument(
+        "--clip-grad",
+        default=1.0,
+        type=float,
+        help="Maximum gradient norm for gradient clipping (set <= 0 to disable). Default: 1.0",
+    )
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
     parser.add_argument(
         "--dest",
@@ -347,6 +399,11 @@ def main():
         default="bf16",
         choices=["none", "fp16", "bf16"],
         help="Automatic Mixed Precision mode (default: bf16).",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile to optimize the neural network execution.",
     )
     parser.add_argument(
         "--no-tf32",

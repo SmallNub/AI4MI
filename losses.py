@@ -23,6 +23,7 @@
 # SOFTWARE.
 
 
+import torch
 from torch import Tensor, einsum
 
 from utils import simplex, sset
@@ -56,7 +57,7 @@ class PartialCrossEntropy(CrossEntropy):
 class GeneralizedDice:
     def __init__(self, **kwargs):
         self.idk = kwargs["idk"]
-        self.eps = kwargs.get("eps", 1e-6)
+        self.eps = 1e-6
         print(f"Initialized {self.__class__.__name__} with {kwargs}")
 
     def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
@@ -67,20 +68,28 @@ class GeneralizedDice:
         p = pred_softmax[:, self.idk, ...]
         t = weak_target[:, self.idk, ...].float()
 
-        # Class weights: w_k = 1 / (|Y_k|^2 + eps)
-        # Sum over spatial dimensions (w, h)
         volumes = einsum("bkwh->bk", t)
-        weights = 1.0 / (volumes**2 + self.eps)
 
-        # Weighted intersection and union/cardinality per batch item
+        present = volumes > 0
+
+        weights = 1.0 / (torch.clamp(volumes, min=1.0) ** 2)
+
         intersection = einsum("bkwh,bkwh->bk", p, t)
         cardinality = einsum("bkwh->bk", p) + volumes
 
-        gdl_num = einsum("bk,bk->b", weights, intersection)
-        gdl_den = einsum("bk,bk->b", weights, cardinality) + self.eps
+        gdl_num = weights * intersection
+        gdl_den = weights * cardinality + self.eps
 
-        gdl_score = 2.0 * gdl_num / gdl_den
-        return (1.0 - gdl_score).mean()
+        dice_per_class = (2.0 * gdl_num) / gdl_den
+        loss_per_class = 1.0 - dice_per_class
+
+        masked_loss = loss_per_class * present.float()
+
+        num_present = present.sum()
+        if num_present == 0:
+            return torch.tensor(0.0, device=pred_softmax.device)
+
+        return masked_loss.sum() / num_present
 
 
 class CompoundLoss:
