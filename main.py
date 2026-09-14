@@ -170,6 +170,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         root_dir,
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
+        augment=args.augment,
         debug=args.debug,
     )
     train_loader = DataLoader(
@@ -370,6 +371,11 @@ def main():
 
     parser.add_argument("--epochs", default=20, type=int)
     parser.add_argument("--dataset", default="SEGTHOR", choices=datasets_params.keys())
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Enable data augmentations (small rotations, scaling, translations).",
+    )
     parser.add_argument("--model", default="ENet", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)

@@ -28,6 +28,7 @@ from typing import Callable, Union
 from torch import Tensor
 from PIL import Image
 from torch.utils.data import Dataset
+import torchvision.transforms.v2 as v2
 
 
 def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
@@ -72,7 +73,23 @@ class SliceDataset(Dataset):
         if debug:
             self.files = self.files[:10]
 
-        print(f">> Created {subset} dataset with {len(self)} images...")
+        if self.augmentation and subset == "train":
+            self.spatial_transform = v2.Compose(
+                [
+                    v2.RandomAffine(
+                        degrees=(-8, 8),
+                        translate=(0.05, 0.05),
+                        scale=(0.95, 1.05),
+                        interpolation=v2.InterpolationMode.BILINEAR,
+                    )
+                ]
+            )
+        else:
+            self.spatial_transform = None
+
+        print(
+            f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None})..."
+        )
 
     def __len__(self):
         return len(self.files)
@@ -91,6 +108,10 @@ class SliceDataset(Dataset):
             K, _, _ = gt.shape
             assert gt.shape == (K, W, H)
 
+            if self.spatial_transform is not None:
+                img, gt = self.spatial_transform(img, gt)
+
+            data_dict["images"] = img
             data_dict["gts"] = gt
 
         return data_dict
