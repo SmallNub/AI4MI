@@ -53,6 +53,8 @@ from utils import (
     tqdm_,
     dice_coef,
     save_images,
+    seed_everything,
+    seed_worker,
 )
 
 from losses import CrossEntropy, GeneralizedDice, CompoundLoss
@@ -108,6 +110,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
 
         torch.backends.cudnn.benchmark = True
 
+    seed_everything(seed=args.seed, deterministic=args.deterministic)
+
     K: int = datasets_params[args.dataset]["K"]
     net = models_params[args.model]["net"](1, K, **models_params[args.model]["args"])
     net.init_weights()
@@ -160,6 +164,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         train_set,
         batch_size=B,
         num_workers=5,
+        worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(args.seed),
         shuffle=True,
         pin_memory=gpu,
         drop_last=True,
@@ -417,6 +423,17 @@ def main():
         action="store_true",
         help="Keep only a fraction (10 samples) of the datasets, "
         "to test the logics around epochs and logging easily.",
+    )
+    parser.add_argument(
+        "--seed",
+        default=42,
+        type=int,
+        help="Random seed for reproducibility (default: 42).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enforce strict CUDA determinism (disables cuDNN benchmarking).",
     )
 
     args = parser.parse_args()
