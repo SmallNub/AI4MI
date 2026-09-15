@@ -28,6 +28,7 @@ from typing import Callable, Union
 from torch import Tensor
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
 
 
@@ -88,7 +89,8 @@ class SliceDataset(Dataset):
             self.spatial_transform = None
 
         print(
-            f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None})..."
+            f">> Created {subset} dataset with {len(self)} images "
+            f"(Augmentation: {self.spatial_transform is not None})..."
         )
 
     def __len__(self):
@@ -109,7 +111,10 @@ class SliceDataset(Dataset):
             assert gt.shape == (K, W, H)
 
             if self.spatial_transform is not None:
-                img, gt = self.spatial_transform(img, gt)
+                # Keep image interpolation smooth while forcing nearest-neighbor labels.
+                img, gt = self.spatial_transform(img, Mask(gt))
+                gt = gt.as_subclass(Tensor)
+                gt[0] = gt[0].masked_fill(gt.sum(dim=0) == 0, 1)
 
             data_dict["images"] = img
             data_dict["gts"] = gt
