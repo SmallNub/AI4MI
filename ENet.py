@@ -408,3 +408,62 @@ class CBAMENet(AttentionENet):
         refined = self.attention_middle(refined)
         refined = self.spatial_middle(refined)
         return _enet_decode(self, output_initial, bn1_out, refined, indices)
+
+
+class FuseBlock(nn.Module):
+    def __init__(self, channels: int, z_window: int):
+        super().__init__()
+        self.fuse = nn.Conv3d(channels, channels, kernel_size=(z_window, 1, 1), bias=False)
+        self.bn = nn.BatchNorm2d(channels)
+        self.act = nn.PReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+                                    # x:    [B, C, Z, H, W]
+        x = self.fuse(x)            #       [B, C, 1, H, W]
+        x = x.squeeze(2)            #       [B, C, H, W]
+        return self.act(self.bn(x))
+
+
+class LateFusionENet(ENet):
+    def __init__(self, in_dim: int, out_dim: int, z_window: int = 3, **kwargs):
+        super().__init__(in_dim=1, out_dim=out_dim, **kwargs)
+        
+        self.z_window = z_window
+        self.center_idx = z_window // 2
+        K = kwargs.get("kernels", 16)
+
+        self.fusion = FuseBlock(channels=K * 4, z_window=z_window)
+
+    def _extract_center(self, tensor: torch.Tensor, B: int) -> torch.Tensor:
+        # Only grab the center slice from Z dims
+        _, C, H, W = tensor.shape
+        unflattened = tensor.view(B, self.z_window, C, H, W)
+        return unflattened[:, self.center_idx, ...]
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        B, Z, C_in, H, W = input.shape
+        assert Z == self.z_window, f"Expected Z={self.z_window}, got {Z}"
+        
+        x_flat = input.view(B * Z, C_in, H, W)
+        output_initial, bn1_out, bn2_out, indices = _enet_features(self, x_flat)
+        bn3_out = self.bottleneck3(bn2_out)
+        
+        _, C_feat, H_feat, W_feat = bn3_out.shape
+        bn3_seq = bn3_out.view(B, Z, C_feat, H_feat, W_feat).permute(0, 2, 1, 3, 4)
+        fused_bn3 = self.fusion(bn3_seq)
+        
+        center_output_initial = self._extract_center(output_initial, B)
+        center_bn1_out = self._extract_center(bn1_out, B)
+        
+        center_indices = (
+            self._extract_center(indices[0], B),
+            self._extract_center(indices[1], B)
+        )
+        
+        return _enet_decode(
+            self, 
+            center_output_initial, 
+            center_bn1_out, 
+            fused_bn3, 
+            center_indices
+        )

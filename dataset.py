@@ -24,6 +24,7 @@
 
 from pathlib import Path
 from typing import Callable, Union
+import torch
 
 from torch import Tensor
 from PIL import Image
@@ -60,14 +61,16 @@ class SliceDataset(Dataset):
         augment=False,
         equalize=False,
         debug=False,
+        z_window=1,
     ):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
         self.augmentation: bool = augment
         self.equalize: bool = equalize
-
-        self.test_mode: bool = subset == "test"
+        self.test_mode: bool = subset == "test"        
+        self.z_window: int = z_window
+        self.half_z: int = z_window // 2
 
         self.files = make_dataset(root_dir, subset)
         if debug:
@@ -87,31 +90,60 @@ class SliceDataset(Dataset):
         else:
             self.spatial_transform = None
 
-        print(
-            f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None})..."
-        )
+        print(f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None}, Z={self.z_window})...")
+
+    def _get_valid_index(self, center_idx: int, offset: int) -> int:
+        """Prevents indexing out of bounds"""
+        target_idx = center_idx + offset
+        
+        if target_idx < 0 or target_idx >= len(self.files):
+            return center_idx
+            
+        center_stem = self.files[center_idx][0].stem
+        target_stem = self.files[target_idx][0].stem
+        
+        center_patient = center_stem.rsplit('_', 1)[0]
+        target_patient = target_stem.rsplit('_', 1)[0]
+        
+        if center_patient != target_patient:
+            return center_idx 
+            
+        return target_idx
 
     def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, index) -> dict[str, Union[Tensor, int, str]]:
-        img_path, gt_path = self.files[index]
+    def __getitem__(self, index) -> dict:
+        img_tensors = []
+        
+        for offset in range(-self.half_z, self.half_z + 1):
+            valid_idx = self._get_valid_index(index, offset)
+            img_path, _ = self.files[valid_idx]
+            img_tensors.append(self.img_transform(Image.open(img_path)))
 
-        img: Tensor = self.img_transform(Image.open(img_path))
-
-        data_dict = {"images": img, "stems": img_path.stem}
+        # Making sure that it works with standard Enet
+        if self.z_window == 1:
+            stacked_img = img_tensors[0]
+        else:
+            stacked_img = torch.stack(img_tensors, dim=0) 
+        
+        center_stem = self.files[index][0].stem
+        data_dict = {"images": stacked_img, "stems": center_stem}
 
         if not self.test_mode:
-            gt: Tensor = self.gt_transform(Image.open(gt_path))
-
-            _, W, H = img.shape
-            K, _, _ = gt.shape
-            assert gt.shape == (K, W, H)
+            _, gt_path = self.files[index]
+            gt = self.gt_transform(Image.open(gt_path))
 
             if self.spatial_transform is not None:
-                img, gt = self.spatial_transform(img, gt)
+                if self.z_window > 1:
+                    Z, C, H, W = stacked_img.shape
+                    flat_img = stacked_img.view(Z * C, H, W)
+                    flat_img, gt = self.spatial_transform(flat_img, gt)
+                    stacked_img = flat_img.view(Z, C, H, W)
+                else:
+                    stacked_img, gt = self.spatial_transform(stacked_img, gt)
 
-            data_dict["images"] = img
+            data_dict["images"] = stacked_img
             data_dict["gts"] = gt
 
         return data_dict

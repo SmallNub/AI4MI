@@ -44,7 +44,7 @@ from functools import partial
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
-from ENet import ENet, AttentionENet, SpatialENet, CBAMENet
+from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
 from utils import (
     Dcm,
     class2one_hot,
@@ -80,6 +80,11 @@ models_params["SpatialENet"] = {
 models_params["CBAMENet"] = {
     "net": CBAMENet,
     "args": {"kernels": 8, "factor": 2},
+}
+
+models_params["LateFusionENet"] = {
+    "net": LateFusionENet,
+    "args": {"kernels": 8, "factor": 2, "z_window": 5},
 }
 
 optimizer_params: dict[str, dict[str, Any]] = {}
@@ -165,6 +170,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
     B: int = datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
 
+    z_window = models_params[args.model]["args"].get("z_window", 1)
+    
     train_set = SliceDataset(
         "train",
         root_dir,
@@ -172,6 +179,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         gt_transform=partial(gt_transform, K),
         augment=args.augment,
         debug=args.debug,
+        z_window=z_window,
     )
     train_loader = DataLoader(
         train_set,
@@ -190,6 +198,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
+        z_window=z_window,
     )
     val_loader = DataLoader(
         val_set,
@@ -279,7 +288,8 @@ def runTraining(args):
 
                     # Sanity tests to see we loaded and encoded the data correctly
                     assert 0 <= img.min() and img.max() <= 1
-                    B, _, W, H = img.shape
+                    B = img.shape[0]
+                    W, H = img.shape[-2:]
 
                     # Forward pass wrapped in torch.autocast context
                     with torch.autocast(
