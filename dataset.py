@@ -29,6 +29,7 @@ import torch
 from torch import Tensor
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
 
 
@@ -138,10 +139,10 @@ class SliceDataset(Dataset):
                 if self.z_window > 1:
                     Z, C, H, W = stacked_img.shape
                     flat_img = stacked_img.view(Z * C, H, W)
-                    flat_img, gt = self.spatial_transform(flat_img, gt)
+                    flat_img, gt = self.spatial_transform(flat_img, Mask(gt))
                     stacked_img = flat_img.view(Z, C, H, W)
                 else:
-                    stacked_img, gt = self.spatial_transform(stacked_img, gt)
+                    stacked_img, gt = self.spatial_transform(stacked_img, Mask(gt))
 
             data_dict["images"] = stacked_img
             data_dict["gts"] = gt
