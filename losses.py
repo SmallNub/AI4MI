@@ -24,6 +24,8 @@
 
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor, einsum
 
 from utils import simplex, sset
@@ -58,54 +60,52 @@ class GeneralizedDice:
     def __init__(self, **kwargs):
         self.idk = kwargs["idk"]
         self.eps = 1e-6
-        print(f"Initialized {self.__class__.__name__} with {kwargs}")
+        self.smooth = 1e-2
 
     def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
-        assert pred_softmax.shape == weak_target.shape
-        assert simplex(pred_softmax)
-        assert sset(weak_target, [0, 1])
+        p = pred_softmax.float()
+        t = weak_target.float()
 
-        p = pred_softmax[:, self.idk, ...]
-        t = weak_target[:, self.idk, ...].float()
+        volumes = torch.sum(t, dim=(0, 2, 3))
 
-        volumes = einsum("bkwh->bk", t)
+        v_frac = volumes / torch.clamp(torch.sum(volumes), min=1e-8)
+        weights = 1.0 / (torch.square(v_frac) + self.smooth)
 
-        present = volumes > 0
+        intersection = torch.sum(p * t, dim=(0, 2, 3))
+        cardinality = torch.sum(p, dim=(0, 2, 3)) + volumes
 
-        weights = 1.0 / (torch.clamp(volumes, min=1.0) ** 2)
+        weights = weights[self.idk]
+        intersection = intersection[self.idk]
+        cardinality = cardinality[self.idk]
 
-        intersection = einsum("bkwh,bkwh->bk", p, t)
-        cardinality = einsum("bkwh->bk", p) + volumes
+        gdl_num = torch.sum(weights * intersection)
+        gdl_den = torch.sum(weights * cardinality) + self.eps
 
-        gdl_num = weights * intersection
-        gdl_den = weights * cardinality + self.eps
-
-        dice_per_class = (2.0 * gdl_num) / gdl_den
-        loss_per_class = 1.0 - dice_per_class
-
-        masked_loss = loss_per_class * present.float()
-
-        num_present = present.sum()
-        if num_present == 0:
-            return torch.tensor(0.0, device=pred_softmax.device)
-
-        return masked_loss.sum() / num_present
+        gdl = 1.0 - (2.0 * gdl_num / gdl_den)
+        return gdl
 
 
-class CompoundLoss:
+class CompoundLoss(nn.Module):
     def __init__(self, **kwargs):
-        self.ce_weight = kwargs.get("ce_weight", 0.5)
-        self.dice_weight = kwargs.get("dice_weight", 0.5)
-
+        super().__init__()
         self.ce = CrossEntropy(**kwargs)
         self.gdl = GeneralizedDice(**kwargs)
 
-        print(
-            f"Initialized {self.__class__.__name__} with CE weight={self.ce_weight}, Dice weight={self.dice_weight}"
+        self.s_ce = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.s_gdl = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+        print(f"Initialized non-negative {self.__class__.__name__}")
+
+    def forward(self, pred_softmax: Tensor, weak_target: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        l_ce = self.ce(pred_softmax, weak_target)
+        l_gdl = self.gdl(pred_softmax, weak_target)
+
+        var_ce = 1.0 + F.softplus(self.s_ce)
+        var_gdl = 1.0 + F.softplus(self.s_gdl)
+
+        loss = (
+            (0.5 / var_ce) * l_ce + 0.5 * torch.log(var_ce) +
+            (0.5 / var_gdl) * l_gdl + 0.5 * torch.log(var_gdl)
         )
 
-    def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
-        ce_val = self.ce(pred_softmax, weak_target)
-        gdl_val = self.gdl(pred_softmax, weak_target)
-
-        return self.ce_weight * ce_val + self.dice_weight * gdl_val
+        return loss, l_ce.detach(), l_gdl.detach()

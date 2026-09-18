@@ -114,7 +114,41 @@ def gt_transform(K, img):
     return img[0]
 
 
-def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoader, int]:
+def build_scheduler(optimizer, warmup_epochs, total_epochs):
+    if optimizer is None:
+        return None
+    if warmup_epochs > 0 and total_epochs > warmup_epochs:
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.01,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=(total_epochs - warmup_epochs),
+            eta_min=1e-6,
+        )
+        return SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+
+
+def setup(
+    args,
+) -> tuple[
+    nn.Module,
+    tuple[Any, Any],
+    tuple[Any, Any],
+    nn.Module,
+    torch.device,
+    DataLoader,
+    DataLoader,
+    int,
+]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
@@ -141,37 +175,53 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
         else:
             print(">> Warning: torch.compile is not supported on this PyTorch version.")
 
-    optimizer = optimizer_params[args.optim]["optim"](
+    if args.mode == "full":
+        supervised_ids = list(range(K))  # Supervise both background and foreground
+    elif args.mode in ["partial"] and args.dataset == "SEGTHOR":
+        supervised_ids = [0, 1, 3, 4]  # Do not supervise the heart (class 2)
+    else:
+        raise ValueError(args.mode, args.dataset)
+
+    loss_kwargs = {
+        "idk": supervised_ids,
+        "ce_weight": args.ce_weight,
+        "dice_weight": args.dice_weight,
+    }
+
+    # 1. Primary Model Optimizer
+    optimizer_net = optimizer_params[args.optim]["optim"](
         net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
     )
 
+    # 2. Secondary Loss Optimizer (if loss has trainable parameters)
+    optimizer_loss = None
+    if args.loss == "ce":
+        loss_fn = CrossEntropy(**loss_kwargs)
+    elif args.loss == "gdl":
+        loss_fn = GeneralizedDice(**loss_kwargs)
+        raise ValueError(">>> Using GeneralizedDice alone is not supported")
+    elif args.loss == "compound":
+        loss_fn = CompoundLoss(**loss_kwargs).to(device)
+        loss_params = list(loss_fn.parameters())
+        if len(loss_params) > 0:
+            optimizer_loss = optimizer_params[args.optim]["optim"](
+                loss_params,
+                lr=1e-3,
+                weight_decay=0.0,
+                **optimizer_params[args.optim]["args"],
+            )
+
     warmup_epochs = getattr(args, "warmup_epochs", 5)
 
-    if warmup_epochs > 0 and args.epochs > warmup_epochs:
-        warmup_scheduler = LinearLR(
-            optimizer, start_factor=0.01, total_iters=warmup_epochs
-        )
-
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, T_max=(args.epochs - warmup_epochs), eta_min=1e-6
-        )
-
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs],
-        )
-    else:
-        scheduler = CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-6
-        )
+    scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
+    scheduler_loss = build_scheduler(optimizer_loss, warmup_epochs, args.epochs)
 
     # Dataset part
     B: int = datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
 
     z_window = models_params[args.model]["args"].get("z_window", 1)
-    
+
     train_set = SliceDataset(
         "train",
         root_dir,
@@ -210,45 +260,40 @@ def setup(args) -> tuple[nn.Module, Any, Any, torch.device, DataLoader, DataLoad
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    return (net, optimizer, scheduler, device, train_loader, val_loader, K)
+    return (
+        net,
+        (optimizer_net, optimizer_loss),
+        (scheduler_net, scheduler_loss),
+        loss_fn,
+        device,
+        train_loader,
+        val_loader,
+        K,
+    )
 
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, scheduler, device, train_loader, val_loader, K = setup(args)
-
-    if args.mode == "full":
-        supervised_ids = list(range(K))  # Supervise both background and foreground
-    elif args.mode in ["partial"] and args.dataset == "SEGTHOR":
-        supervised_ids = [0, 1, 3, 4]  # Do not supervise the heart (class 2)
-    else:
-        raise ValueError(args.mode, args.dataset)
-
-    loss_kwargs = {
-        "idk": supervised_ids,
-        "ce_weight": args.ce_weight,
-        "dice_weight": args.dice_weight,
-    }
-
-    if args.loss == "ce":
-        loss_fn = CrossEntropy(**loss_kwargs)
-    elif args.loss == "gdl":
-        loss_fn = GeneralizedDice(**loss_kwargs)
-        raise ValueError(">>> Using GeneralizedDice alone is not supported")
-    elif args.loss == "compound":
-        loss_fn = CompoundLoss(**loss_kwargs)
-
-    if args.compile and hasattr(torch, "compile"):
-        loss_fn = torch.compile(loss_fn)
+    (
+        net,
+        (optimizer_net, optimizer_loss),
+        (scheduler_net, scheduler_loss),
+        loss_fn,
+        device,
+        train_loader,
+        val_loader,
+        K,
+    ) = setup(args)
 
     amp_enabled: bool = args.amp != "none" and device.type == "cuda"
     amp_dtype = torch.bfloat16 if args.amp == "bf16" else torch.float16
 
-    scaler = torch.amp.GradScaler(device.type, enabled=(amp_enabled and args.amp == "fp16"))
+    scaler = torch.amp.GradScaler(
+        device.type, enabled=(amp_enabled and args.amp == "fp16")
+    )
 
     print(f">> Mixed Precision (AMP): {args.amp.upper()} (Enabled: {amp_enabled})")
 
-    # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
@@ -261,67 +306,68 @@ def runTraining(args):
             match m:
                 case "train":
                     net.train()
-                    opt = optimizer
                     cm = Dcm
                     desc = f">> Training   ({e: 4d})"
                     loader = train_loader
                     log_loss = log_loss_tra
                     log_dice = log_dice_tra
+                    is_train = True
                 case "val":
                     net.eval()
-                    opt = None
                     cm = torch.no_grad
                     desc = f">> Validation ({e: 4d})"
                     loader = val_loader
                     log_loss = log_loss_val
                     log_dice = log_dice_val
+                    is_train = False
 
-            with cm():  # Either dummy context manager, or torch.no_grad for validation
+            with cm():
                 j = 0
                 tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
                 for i, data in tq_iter:
                     img = data["images"].to(device, non_blocking=True)
                     gt = data["gts"].to(device, non_blocking=True)
 
-                    if opt:  # So only for training
-                        opt.zero_grad(set_to_none=True)
+                    if is_train:
+                        optimizer_net.zero_grad(set_to_none=True)
+                        if optimizer_loss:
+                            optimizer_loss.zero_grad(set_to_none=True)
 
-                    # Sanity tests to see we loaded and encoded the data correctly
                     assert 0 <= img.min() and img.max() <= 1
                     B = img.shape[0]
                     W, H = img.shape[-2:]
 
-                    # Forward pass wrapped in torch.autocast context
                     with torch.autocast(
                         device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
                     ):
                         pred_logits = net(img)
-                        pred_probs = F.softmax(
-                            1 * pred_logits, dim=1
-                        )  # 1 is the temperature parameter
-                        loss = loss_fn(pred_probs, gt)
+                        pred_probs = F.softmax(1 * pred_logits, dim=1)
+                        loss, *loss_info = loss_fn(pred_probs, gt)
 
-                    # Metrics computation (casting to float32 for metric stability)
                     with torch.no_grad():
                         pred_seg = probs2one_hot(pred_probs)
-                        log_dice[e, j : j + B, :] = dice_coef(
-                            pred_seg, gt
-                        )  # One DSC value per sample and per class
+                        log_dice[e, j : j + B, :] = dice_coef(pred_seg, gt)
 
-                    log_loss[e, i] = (
-                        loss.item()
-                    )  # One loss value per batch (averaged in the loss)
+                    log_loss[e, i] = loss.item()
 
-                    if opt:  # Only for training
+                    if is_train:
                         scaler.scale(loss).backward()
 
                         if args.clip_grad > 0:
-                            scaler.unscale_(opt)
+                            scaler.unscale_(optimizer_net)
                             torch.nn.utils.clip_grad_norm_(
                                 net.parameters(), max_norm=args.clip_grad
                             )
+                            if optimizer_loss:
+                                scaler.unscale_(optimizer_loss)
+                                torch.nn.utils.clip_grad_norm_(
+                                    loss_fn.parameters(), max_norm=args.clip_grad
+                                )
 
-                        scaler.step(opt)
+                        scaler.step(optimizer_net)
+                        if optimizer_loss:
+                            scaler.step(optimizer_loss)
+
                         scaler.update()
 
                     if m == "val":
@@ -335,12 +381,20 @@ def runTraining(args):
                                 args.dest / f"iter{e:03d}" / m,
                             )
 
-                    j += B  # Keep in mind that _in theory_, each batch might have a different size
-                    # For the DSC average: do not take the background class (0) into account:
+                    j += B
                     postfix_dict: dict[str, str] = {
                         "Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
                         "Loss": f"{log_loss[e, :i + 1].mean():5.2e}",
                     }
+                    if isinstance(loss_fn, CompoundLoss):
+                        sigma_ce = torch.exp(0.5 * loss_fn.s_ce).item()
+                        sigma_gdl = torch.exp(0.5 * loss_fn.s_gdl).item()
+                        postfix_dict |= {
+                            "CE": f"{loss_info[0].item():5.2e}",
+                            "GDL": f"{loss_info[1].item():5.2e}",
+                            "s_ce": f"{sigma_ce:.2f}",
+                            "s_gdl": f"{sigma_gdl:.2f}",
+                        }
                     if K > 2:
                         postfix_dict |= {
                             f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
@@ -348,7 +402,9 @@ def runTraining(args):
                         }
                     tq_iter.set_postfix(postfix_dict)
 
-        scheduler.step()
+        scheduler_net.step()
+        if scheduler_loss:
+            scheduler_loss.step()
 
         # Save results at each epoch
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
@@ -357,7 +413,9 @@ def runTraining(args):
         np.save(args.dest / "dice_val.npy", log_dice_val)
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
-        print(f">> LR: {scheduler.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}")
+        print(
+            f">> LR: {scheduler_net.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}"
+        )
 
         if current_dice > best_dice:
             message = f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
