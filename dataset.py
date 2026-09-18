@@ -69,7 +69,7 @@ class SliceDataset(Dataset):
         self.gt_transform: Callable = gt_transform
         self.augmentation: bool = augment
         self.equalize: bool = equalize
-        self.test_mode: bool = subset == "test"        
+        self.test_mode: bool = subset == "test"
         self.z_window: int = z_window
         self.half_z: int = z_window // 2
 
@@ -81,7 +81,7 @@ class SliceDataset(Dataset):
             self.spatial_transform = v2.Compose(
                 [
                     v2.RandomAffine(
-                        degrees=(-8, 8),
+                        degrees=(-5, 5),
                         translate=(0.05, 0.05),
                         scale=(0.95, 1.05),
                         interpolation=v2.InterpolationMode.BILINEAR,
@@ -91,24 +91,26 @@ class SliceDataset(Dataset):
         else:
             self.spatial_transform = None
 
-        print(f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None}, Z={self.z_window})...")
+        print(
+            f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None}, Z={self.z_window})..."
+        )
 
     def _get_valid_index(self, center_idx: int, offset: int) -> int:
         """Prevents indexing out of bounds"""
         target_idx = center_idx + offset
-        
+
         if target_idx < 0 or target_idx >= len(self.files):
             return center_idx
-            
+
         center_stem = self.files[center_idx][0].stem
         target_stem = self.files[target_idx][0].stem
-        
-        center_patient = center_stem.rsplit('_', 1)[0]
-        target_patient = target_stem.rsplit('_', 1)[0]
-        
+
+        center_patient = center_stem.rsplit("_", 1)[0]
+        target_patient = target_stem.rsplit("_", 1)[0]
+
         if center_patient != target_patient:
-            return center_idx 
-            
+            return center_idx
+
         return target_idx
 
     def __len__(self):
@@ -116,7 +118,7 @@ class SliceDataset(Dataset):
 
     def __getitem__(self, index) -> dict:
         img_tensors = []
-        
+
         for offset in range(-self.half_z, self.half_z + 1):
             valid_idx = self._get_valid_index(index, offset)
             img_path, _ = self.files[valid_idx]
@@ -126,8 +128,8 @@ class SliceDataset(Dataset):
         if self.z_window == 1:
             stacked_img = img_tensors[0]
         else:
-            stacked_img = torch.stack(img_tensors, dim=0) 
-        
+            stacked_img = torch.stack(img_tensors, dim=0)
+
         center_stem = self.files[index][0].stem
         data_dict = {"images": stacked_img, "stems": center_stem}
 

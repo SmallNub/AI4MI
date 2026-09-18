@@ -357,7 +357,6 @@ def main() -> None:
 
     v_folder = args.volumes_folder if args.volumes_folder else args.data_folder
 
-    # 1. Look for PNG slices in data_folder OR NIfTI volumes directly in v_folder
     images: list[Path] = list(args.data_folder.glob("*.png"))
     grouping_regex: Pattern = re.compile(args.grp_regex)
 
