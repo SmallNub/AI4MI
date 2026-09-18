@@ -152,7 +152,7 @@ def merge_patient(
     assert set(np.unique(res_arr)) <= set(range(K))
     assert orig_shape == res_arr.shape, (orig_shape, res_arr.shape)
 
-    # Scale normalization back to standard class integers (e.g., SegTHOR values)
+    # Scale normalization back to standard class integers
     res_arr //= 63
     assert set(np.unique(res_arr)).issubset(
         set(range(5))

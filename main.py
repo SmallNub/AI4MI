@@ -45,6 +45,7 @@ from functools import partial
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
 from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
+from ImprovedENet import ImprovedENet
 from utils import (
     Dcm,
     class2one_hot,
@@ -81,10 +82,13 @@ models_params["CBAMENet"] = {
     "net": CBAMENet,
     "args": {"kernels": 8, "factor": 2},
 }
-
 models_params["LateFusionENet"] = {
     "net": LateFusionENet,
     "args": {"kernels": 8, "factor": 2, "z_window": 5},
+}
+models_params["ImprovedENet"] = {
+    "net": ImprovedENet,
+    "args": {"kernels": 8, "factor": 2},
 }
 
 optimizer_params: dict[str, dict[str, Any]] = {}
@@ -188,12 +192,10 @@ def setup(
         "dice_weight": args.dice_weight,
     }
 
-    # 1. Primary Model Optimizer
     optimizer_net = optimizer_params[args.optim]["optim"](
         net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
     )
 
-    # 2. Secondary Loss Optimizer (if loss has trainable parameters)
     optimizer_loss = None
     if args.loss == "ce":
         loss_fn = CrossEntropy(**loss_kwargs)
