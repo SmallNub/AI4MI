@@ -48,7 +48,7 @@ class CrossEntropy:
         loss = -einsum("bkwh,bkwh->", mask, log_p)
         loss /= mask.sum() + 1e-10
 
-        return loss
+        return loss, []
 
 
 class PartialCrossEntropy(CrossEntropy):
@@ -97,8 +97,13 @@ class CompoundLoss(nn.Module):
         print(f"Initialized non-negative {self.__class__.__name__}")
 
     def forward(self, pred_softmax: Tensor, weak_target: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        l_ce = self.ce(pred_softmax, weak_target)
+        # 1. Unpack CrossEntropy return tuple (loss, loss_info)
+        l_ce, _ = self.ce(pred_softmax, weak_target)
         l_gdl = self.gdl(pred_softmax, weak_target)
+
+        # 2. Ensure floating point types match
+        l_ce = l_ce.float()
+        l_gdl = l_gdl.float()
 
         var_ce = 1.0 + F.softplus(self.s_ce)
         var_gdl = 1.0 + F.softplus(self.s_gdl)
