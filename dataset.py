@@ -23,10 +23,9 @@
 # SOFTWARE.
 
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable
 import torch
 
-from torch import Tensor
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
@@ -124,7 +123,6 @@ class SliceDataset(Dataset):
             img_path, _ = self.files[valid_idx]
             img_tensors.append(self.img_transform(Image.open(img_path)))
 
-        # Making sure that it works with standard Enet
         if self.z_window == 1:
             stacked_img = img_tensors[0]
         else:

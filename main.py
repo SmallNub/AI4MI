@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
     LinearLR,
     SequentialLR,
 )
@@ -124,12 +124,12 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
     if warmup_epochs > 0 and total_epochs > warmup_epochs:
         warmup_scheduler = LinearLR(
             optimizer,
-            start_factor=0.01,
+            start_factor=0.1,
             total_iters=warmup_epochs,
         )
-        cosine_scheduler = CosineAnnealingLR(
+        cosine_scheduler = CosineAnnealingWarmRestarts(
             optimizer,
-            T_max=(total_epochs - warmup_epochs),
+            T_0=(total_epochs - warmup_epochs) // 3,
             eta_min=1e-6,
         )
         return SequentialLR(
@@ -138,7 +138,7 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
             milestones=[warmup_epochs],
         )
     else:
-        return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+        return CosineAnnealingWarmRestarts(optimizer, T_0=total_epochs // 3, eta_min=1e-6)
 
 
 def setup(
@@ -188,8 +188,6 @@ def setup(
 
     loss_kwargs = {
         "idk": supervised_ids,
-        "ce_weight": args.ce_weight,
-        "dice_weight": args.dice_weight,
     }
 
     optimizer_net = optimizer_params[args.optim]["optim"](
@@ -216,10 +214,10 @@ def setup(
     warmup_epochs = getattr(args, "warmup_epochs", 5)
 
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
-    scheduler_loss = build_scheduler(optimizer_loss, warmup_epochs, args.epochs)
+    # scheduler_loss = build_scheduler(optimizer_loss, warmup_epochs, args.epochs)
 
     # Dataset part
-    B: int = datasets_params[args.dataset]["B"]
+    B: int = args.batch_size if hasattr(args, "batch_size") else datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
 
     z_window = models_params[args.model]["args"].get("z_window", 1)
@@ -265,7 +263,7 @@ def setup(
     return (
         net,
         (optimizer_net, optimizer_loss),
-        (scheduler_net, scheduler_loss),
+        (scheduler_net, None),
         loss_fn,
         device,
         train_loader,
@@ -446,6 +444,12 @@ def main():
         action="store_true",
         help="Enable data augmentations (small rotations, scaling, translations).",
     )
+    parser.add_argument(
+        "--batch_size",
+        default=8,
+        type=int,
+        help="Batch size for training and validation.",
+    )
     parser.add_argument("--model", default="ENet", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)
@@ -460,18 +464,6 @@ def main():
         default="ce",
         choices=["ce", "gdl", "compound"],
         help="Loss function to use: 'ce', 'gdl', or 'compound' (weighted mix).",
-    )
-    parser.add_argument(
-        "--ce-weight",
-        default=0.5,
-        type=float,
-        help="Weight for Cross Entropy when using compound loss.",
-    )
-    parser.add_argument(
-        "--dice-weight",
-        default=0.5,
-        type=float,
-        help="Weight for Generalized Dice when using compound loss.",
     )
     parser.add_argument(
         "--clip-grad",
