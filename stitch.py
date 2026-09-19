@@ -49,63 +49,121 @@ def get_z(image: Path) -> int:
 def post_process_3d(
     arr: np.ndarray,
     num_classes: int = 5,
-    min_voxels: dict[int, int] | None = None,
     crop_z_margins: bool = False,
-    fill_holes: bool = True,
 ) -> np.ndarray:
+    """
+    Organ-specific 3D post-processing tailored for axial CT volumes.
+    Iterates sequentially through class indices 1 to 4.
+    Input shape expected: (H, W, Z) where Z is the axial slice index.
+    
+    Classes:
+        1: Esophagus
+        2: Heart
+        3: Trachea
+        4: Aorta
+    """
     cleaned_arr = np.zeros_like(arr)
-    struct_26 = generate_binary_structure(3, 3)
+    struct_3d_26 = generate_binary_structure(3, 3)
+    struct_2d_8 = generate_binary_structure(2, 2)
 
-    if min_voxels is None:
-        min_voxels = {
-            1: 2500,
-            2: 40000,
-            3: 1800,
-            4: 8000,
-        }
-    Z = arr.shape[2]
+    H, W, Z = arr.shape
     z_min, z_max = 0, Z
     if crop_z_margins:
         z_min = int(Z * 0.05)
         z_max = int(Z * 0.95)
 
+    # Process sequentially by class index (1: Esophagus, 2: Heart, 3: Trachea, 4: Aorta)
     for c in range(1, num_classes):
-        binary_mask = arr[:, :, z_min:z_max] == c
-        if not binary_mask.any():
+        mask = arr[:, :, z_min:z_max] == c
+        if not mask.any():
             continue
 
-        # Close small gaps
-        binary_mask = binary_closing(binary_mask, structure=struct_26, iterations=1)
-
-        # Fill holes inside the predicted organ volumes
-        if fill_holes:
-            binary_mask = binary_fill_holes(binary_mask)
-
-        # Connected Components
-        labeled_mask, num_features = label(binary_mask, structure=struct_26)
-        if num_features == 0:
-            continue
-
-        # Count sizes, but zero out the background (index 0) so direct indexing works safely
-        component_sizes = np.bincount(labeled_mask.ravel())
-        component_sizes[0] = 0
-
-        # Protect against overlapping boundaries caused by morphological closing
-        empty_space_mask = cleaned_arr[:, :, z_min:z_max] == 0
-
+        # -------------------------------------------------------------
+        # Class 1: Esophagus (Thin vertical structure across axial slices)
+        # -------------------------------------------------------------
         if c == 1:
-            # Esophagus: Filter by voxel threshold
-            min_size = min_voxels.get(c, 0)
-            valid_indices = np.where(component_sizes >= min_size)[0]
-            valid_mask = np.isin(labeled_mask, valid_indices)
+            labeled_mask, num_features = label(mask, structure=struct_3d_26)
+            if num_features > 0:
+                sizes = np.bincount(labeled_mask.ravel())
+                sizes[0] = 0
 
-            cleaned_arr[:, :, z_min:z_max][valid_mask & empty_space_mask] = c
-        else:
-            # Heart, Trachea, Aorta: Retain strictly the largest contiguous component
-            largest_idx = np.argmax(component_sizes)
-            if component_sizes[largest_idx] >= min_voxels.get(c, 0):
-                largest_mask = labeled_mask == largest_idx
-                cleaned_arr[:, :, z_min:z_max][largest_mask & empty_space_mask] = c
+                # Filter small noise artifacts while keeping largest valid components
+                valid_labels = np.where(sizes >= 250)[0]
+                if len(valid_labels) > 0:
+                    mask = np.isin(labeled_mask, valid_labels)
+                else:
+                    mask = labeled_mask == np.argmax(sizes)
+
+            # Bridge axial Z-axis gaps (up to 2-3 missing slices vertically)
+            z_gap_kernel = np.zeros((1, 1, 5), dtype=bool)
+            z_gap_kernel[0, 0, :] = True
+            mask = binary_closing(mask, structure=z_gap_kernel)
+
+        # -------------------------------------------------------------
+        # Class 2: Heart (Large compact structure)
+        # -------------------------------------------------------------
+        elif c == 2:
+            # 2D hole filling on each axial slice
+            for z in range(mask.shape[2]):
+                if mask[:, :, z].any():
+                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
+
+            # 3D closing to smooth volumetric boundaries
+            mask = binary_closing(mask, structure=struct_3d_26, iterations=2)
+
+            # Keep only the single largest contiguous component
+            labeled_mask, num_features = label(mask, structure=struct_3d_26)
+            if num_features > 0:
+                sizes = np.bincount(labeled_mask.ravel())
+                sizes[0] = 0
+                mask = labeled_mask == np.argmax(sizes)
+
+        # -------------------------------------------------------------
+        # Class 3: Trachea (Continuous central airway)
+        # -------------------------------------------------------------
+        elif c == 3:
+            # 2D slice-wise hole filling (airway lumen)
+            for z in range(mask.shape[2]):
+                if mask[:, :, z].any():
+                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
+
+            labeled_mask, num_features = label(mask, structure=struct_3d_26)
+            if num_features > 0:
+                sizes = np.bincount(labeled_mask.ravel())
+                sizes[0] = 0
+                # Retain the largest component to prevent empty predictions (prevents inf HD95)
+                mask = labeled_mask == np.argmax(sizes)
+
+            # Close minor Z-axis gaps between slices
+            z_kernel = np.zeros((1, 1, 3), dtype=bool)
+            z_kernel[0, 0, :] = True
+            mask = binary_closing(mask, structure=z_kernel)
+
+        # -------------------------------------------------------------
+        # Class 4: Aorta (Ascending/Descending tubular sections)
+        # -------------------------------------------------------------
+        elif c == 4:
+            # Enforce solid cross-sections per axial slice
+            for z in range(mask.shape[2]):
+                if mask[:, :, z].any():
+                    slice_2d = binary_closing(mask[:, :, z], structure=struct_2d_8, iterations=1)
+                    mask[:, :, z] = binary_fill_holes(slice_2d)
+
+            labeled_mask, num_features = label(mask, structure=struct_3d_26)
+            if num_features > 0:
+                sizes = np.bincount(labeled_mask.ravel())
+                sizes[0] = 0
+
+                # Retain primary components (> 1500 voxels) to keep both arch & descending sections
+                valid_labels = np.where(sizes >= 1500)[0]
+                if len(valid_labels) > 0:
+                    mask = np.isin(labeled_mask, valid_labels)
+                else:
+                    mask = labeled_mask == np.argmax(sizes)
+
+        # Prevent overwriting previously assigned voxel space
+        empty_space = cleaned_arr[:, :, z_min:z_max] == 0
+        cleaned_arr[:, :, z_min:z_max][mask & empty_space] = c
 
     return cleaned_arr
 
