@@ -58,7 +58,7 @@ from utils import (
     seed_worker,
 )
 
-from losses import CrossEntropy, GeneralizedDice, CompoundLoss
+from losses import CrossEntropy, FocalLoss, GeneralizedDice, CompoundLoss
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -129,7 +129,8 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
         )
         cosine_scheduler = CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=(total_epochs - warmup_epochs) // 3,
+            T_0=8,
+            T_mult=0.8,
             eta_min=1e-6,
         )
         return SequentialLR(
@@ -138,7 +139,12 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
             milestones=[warmup_epochs],
         )
     else:
-        return CosineAnnealingWarmRestarts(optimizer, T_0=total_epochs // 3, eta_min=1e-6)
+        return CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=8,
+            T_mult=0.8,
+            eta_min=1e-6,
+        )
 
 
 def setup(
@@ -187,7 +193,9 @@ def setup(
         raise ValueError(args.mode, args.dataset)
 
     loss_kwargs = {
+        "use_focal": args.use_focal if hasattr(args, "use_focal") else False,
         "idk": supervised_ids,
+        "device": device,
     }
 
     optimizer_net = optimizer_params[args.optim]["optim"](
@@ -196,10 +204,12 @@ def setup(
 
     optimizer_loss = None
     if args.loss == "ce":
-        loss_fn = CrossEntropy(**loss_kwargs)
+        if loss_kwargs["use_focal"]:
+            loss_fn = FocalLoss(**loss_kwargs)
+        else:
+            loss_fn = CrossEntropy(**loss_kwargs)
     elif args.loss == "gdl":
         loss_fn = GeneralizedDice(**loss_kwargs)
-        raise ValueError(">>> Using GeneralizedDice alone is not supported")
     elif args.loss == "compound":
         loss_fn = CompoundLoss(**loss_kwargs).to(device)
         loss_params = list(loss_fn.parameters())
@@ -234,7 +244,8 @@ def setup(
     train_loader = DataLoader(
         train_set,
         batch_size=B,
-        num_workers=5,
+        num_workers=8,
+        prefetch_factor=2,
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed),
         shuffle=True,
@@ -253,7 +264,8 @@ def setup(
     val_loader = DataLoader(
         val_set,
         batch_size=B,
-        num_workers=5,
+        num_workers=8,
+        prefetch_factor=2,
         shuffle=False,
         pin_memory=gpu,
     )
@@ -464,6 +476,11 @@ def main():
         default="ce",
         choices=["ce", "gdl", "compound"],
         help="Loss function to use: 'ce', 'gdl', or 'compound' (weighted mix).",
+    )
+    parser.add_argument(
+        "--use_focal",
+        action="store_true",
+        help="Use Focal Loss instead of Cross-Entropy Loss.",
     )
     parser.add_argument(
         "--clip-grad",
