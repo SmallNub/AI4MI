@@ -90,12 +90,13 @@ class ImprovedENet(nn.Module):
         )
 
         # Encoder
-        self.enc1 = nn.Sequential(nn.MaxPool2d(2), DepthwiseSeparableBlock(K, K * 2))
-        self.enc2 = nn.Sequential(nn.MaxPool2d(2), DepthwiseSeparableBlock(K * 2, K * 4))
-        self.enc3 = nn.Sequential(nn.MaxPool2d(2), DepthwiseSeparableBlock(K * 4, K * 8))
+        self.enc1 = DepthwiseSeparableBlock(K, K * 2, stride=2)
+        self.enc2 = DepthwiseSeparableBlock(K * 2, K * 4, stride=2)
+        self.enc3 = DepthwiseSeparableBlock(K * 4, K * 8, stride=2)
 
         # Bottleneck
         self.bottleneck = nn.Sequential(
+            DepthwiseSeparableBlock(K * 8, K * 8),
             DepthwiseSeparableBlock(K * 8, K * 8),
             DepthwiseSeparableBlock(K * 8, K * 8)
         )
@@ -109,6 +110,10 @@ class ImprovedENet(nn.Module):
         self.final = nn.Conv2d(K, out_dim, kernel_size=1)
 
     def forward(self, input: Tensor) -> Tensor:
+        if input.dim() == 5:
+            B, Z, C, H, W = input.shape
+            input = input.view(B, Z * C, H, W)
+
         x0 = self.stem(input)
         x1 = self.enc1(x0)
         x2 = self.enc2(x1)

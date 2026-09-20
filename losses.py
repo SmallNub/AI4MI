@@ -34,9 +34,12 @@ from utils import simplex, sset
 class CrossEntropy:
     def __init__(self, class_weights: list[float] | Tensor = None, **kwargs):
         self.idk = kwargs["idk"]
+        self.eps = 1e-6
         if class_weights is None:
             class_weights = [0.01, 5.0, 1.0, 5.0, 2.0]
-        self.weights = torch.tensor(class_weights, dtype=torch.float32).to(kwargs.get("device", "cpu"))
+        self.weights = torch.tensor(class_weights, dtype=torch.float32).to(
+            kwargs.get("device", "cpu")
+        )
         print(
             f"Initialized {self.__class__.__name__} with weights={self.weights.tolist()} and kwargs={kwargs}"
         )
@@ -49,15 +52,15 @@ class CrossEntropy:
         assert sset(weak_target, [0, 1])
 
         # Restrict to supervised classes
-        p = pred_softmax[:, self.idk, ...]
+        p = pred_softmax[:, self.idk, ...].float()
         t = weak_target[:, self.idk, ...].float()
         w = self.weights[self.idk].view(1, len(self.idk), 1, 1)
 
-        log_p = (p + 1e-6).log()
+        log_p = (p + self.eps).log()
 
         # Multiply element-wise by weights and sum over all dimensions
         weighted_loss = -(t * log_p * w).sum()
-        normalizer = (t * w).sum() + 1e-6
+        normalizer = (t * w).sum() + self.eps
 
         loss = weighted_loss / normalizer
         return loss, []
@@ -69,11 +72,14 @@ class FocalLoss:
     ):
         self.idk = kwargs["idk"]
         self.gamma = gamma
+        self.eps = 1e-6
         if class_weights is None:
             class_weights = [0.01, 5.0, 1.0, 5.0, 2.0]
-        self.weights = torch.tensor(class_weights, dtype=torch.float32).to(kwargs.get("device", "cpu"))
+
+        device = kwargs.get("device", "cpu")
+        self.weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
         print(
-            f"Initialized {self.__class__.__name__} with gamma={gamma}, weights={self.weights.tolist()}, and kwargs={kwargs}"
+            f"Initialized {self.__class__.__name__} with gamma={self.gamma}, weights={self.weights.tolist()} and kwargs={kwargs}"
         )
 
     def __call__(
@@ -83,22 +89,22 @@ class FocalLoss:
         assert simplex(pred_softmax)
         assert sset(weak_target, [0, 1])
 
-        # Restrict to supervised classes
-        p = pred_softmax[:, self.idk, ...]
+        p = pred_softmax[:, self.idk, ...].float()
         t = weak_target[:, self.idk, ...].float()
-        w = self.weights[self.idk].view(1, len(self.idk), 1, 1)
 
-        p_clamped = torch.clamp(p, min=1e-6, max=1.0 - 1e-6)
+        w = self.weights[self.idk].view(1, len(self.idk), *([1] * (p.dim() - 2)))
 
+        p_clamped = p.clamp(min=self.eps, max=1.0 - self.eps)
         log_p = p_clamped.log()
-        log_1m_p = torch.log1p(-p_clamped)
 
-        focal_weight = torch.exp(self.gamma * log_1m_p)
+        one_minus_p = (1.0 - p_clamped).clamp(min=self.eps)
+        focal_weight = one_minus_p ** self.gamma
 
-        focal_loss = -(t * focal_weight * log_p * w).sum()
-        normalizer = (t * w).sum() + 1e-6
+        weighted_loss = -(t * focal_weight * log_p * w).sum()
 
-        loss = focal_loss / normalizer
+        normalizer = (t * w).sum() + self.eps
+        loss = weighted_loss / normalizer
+
         return loss, []
 
 
@@ -119,7 +125,7 @@ class GeneralizedDice:
 
         volumes = torch.sum(t, dim=(0, 2, 3))
 
-        v_frac = volumes / torch.clamp(torch.sum(volumes), min=1e-6)
+        v_frac = volumes / torch.clamp(torch.sum(volumes), min=self.eps)
         weights = 1.0 / (torch.square(v_frac) + self.smooth)
 
         intersection = torch.sum(p * t, dim=(0, 2, 3))

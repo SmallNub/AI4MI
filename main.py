@@ -88,7 +88,7 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 8, "factor": 2},
+    "args": {"kernels": 8, "factor": 2, "z_window": 3},
 }
 
 optimizer_params: dict[str, dict[str, Any]] = {}
@@ -130,7 +130,7 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
         cosine_scheduler = CosineAnnealingWarmRestarts(
             optimizer,
             T_0=8,
-            T_mult=0.8,
+            T_mult=2,
             eta_min=1e-6,
         )
         return SequentialLR(
@@ -142,7 +142,7 @@ def build_scheduler(optimizer, warmup_epochs, total_epochs):
         return CosineAnnealingWarmRestarts(
             optimizer,
             T_0=8,
-            T_mult=0.8,
+            T_mult=2,
             eta_min=1e-6,
         )
 
@@ -165,7 +165,7 @@ def setup(
 
     if gpu:
         if args.tf32:
-            torch.set_float32_matmul_precision("high")
+            torch.set_float32_matmul_precision("medium")
             torch.backends.cudnn.allow_tf32 = True
             print(">> Enabled TF32 precision")
 
@@ -174,7 +174,9 @@ def setup(
     seed_everything(seed=args.seed, deterministic=args.deterministic)
 
     K: int = datasets_params[args.dataset]["K"]
-    net = models_params[args.model]["net"](1, K, **models_params[args.model]["args"])
+    z_window = models_params[args.model]["args"].get("z_window", 1)
+
+    net = models_params[args.model]["net"](z_window, K, **models_params[args.model]["args"])
     net.init_weights()
     net.to(device)
 
@@ -229,8 +231,6 @@ def setup(
     # Dataset part
     B: int = args.batch_size if hasattr(args, "batch_size") else datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
-
-    z_window = models_params[args.model]["args"].get("z_window", 1)
 
     train_set = SliceDataset(
         "train",
