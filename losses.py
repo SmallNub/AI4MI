@@ -30,8 +30,8 @@ from torch import Tensor
 
 from utils import simplex, sset
 
-EPS = 1e-6
-DEFAULT_WEIGHTS = [0.2, 2.2, 1.0, 2.5, 1.2]
+EPS = 1e-4
+DEFAULT_WEIGHTS = [0.2, 2.0, 1.0, 2.5, 1.2]
 
 
 class CrossEntropy:
@@ -57,13 +57,14 @@ class CrossEntropy:
         # Restrict to supervised classes
         p = pred_softmax[:, self.idk, ...].float()
         t = weak_target[:, self.idk, ...].float()
-        w = self.weights[self.idk].view(1, len(self.idk), 1, 1)
+        w = self.weights[self.idk].view(1, len(self.idk), *([1] * (p.dim() - 2)))
 
-        log_p = (p + self.eps).log()
+        p_clamped = p.clamp(min=self.eps, max=1.0 - self.eps)
+        log_p = p_clamped.log()
 
         # Multiply element-wise by weights and sum over all dimensions
         weighted_loss = -(t * log_p * w).sum()
-        normalizer = (t * w).sum() + self.eps
+        normalizer = torch.clamp((t * w).sum(), min=self.eps)
 
         loss = weighted_loss / normalizer
         return loss, []
@@ -105,7 +106,7 @@ class FocalLoss:
 
         weighted_loss = -(t * focal_weight * log_p * w).sum()
 
-        normalizer = (t * w).sum() + self.eps
+        normalizer = torch.clamp((t * w).sum(), min=self.eps)
         loss = weighted_loss / normalizer
 
         return loss, []
@@ -139,7 +140,7 @@ class GeneralizedDice:
         cardinality = cardinality[self.idk]
 
         gdl_num = torch.sum(weights * intersection)
-        gdl_den = torch.sum(weights * cardinality) + self.eps
+        gdl_den = torch.clamp((weights * cardinality).sum(), min=self.eps)
 
         gdl = 1.0 - (2.0 * gdl_num / gdl_den)
         return gdl, []
