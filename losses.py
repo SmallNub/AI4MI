@@ -30,13 +30,16 @@ from torch import Tensor
 
 from utils import simplex, sset
 
+EPS = 1e-6
+DEFAULT_WEIGHTS = [0.2, 2.2, 1.0, 2.5, 1.2]
+
 
 class CrossEntropy:
     def __init__(self, class_weights: list[float] | Tensor = None, **kwargs):
         self.idk = kwargs["idk"]
-        self.eps = 1e-6
+        self.eps = EPS
         if class_weights is None:
-            class_weights = [0.01, 5.0, 1.0, 5.0, 2.0]
+            class_weights = DEFAULT_WEIGHTS
         self.weights = torch.tensor(class_weights, dtype=torch.float32).to(
             kwargs.get("device", "cpu")
         )
@@ -68,13 +71,13 @@ class CrossEntropy:
 
 class FocalLoss:
     def __init__(
-        self, gamma: float = 0.5, class_weights: list[float] | Tensor = None, **kwargs
+        self, gamma: float = 1.5, class_weights: list[float] | Tensor = None, **kwargs
     ):
         self.idk = kwargs["idk"]
         self.gamma = gamma
-        self.eps = 1e-6
+        self.eps = EPS
         if class_weights is None:
-            class_weights = [0.01, 5.0, 1.0, 5.0, 2.0]
+            class_weights = DEFAULT_WEIGHTS
 
         device = kwargs.get("device", "cpu")
         self.weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -116,8 +119,8 @@ class PartialCrossEntropy(CrossEntropy):
 class GeneralizedDice:
     def __init__(self, **kwargs):
         self.idk = kwargs["idk"]
-        self.eps = 1e-6
-        self.smooth = 1e-2
+        self.eps = EPS
+        self.smooth = 1e-1
 
     def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
         p = pred_softmax.float()
@@ -146,7 +149,7 @@ class CompoundLoss(nn.Module):
     def __init__(
         self,
         use_focal: bool = False,
-        gamma: float = 0.5,
+        gamma: float = 1.5,
         class_weights: list[float] = None,
         **kwargs,
     ):
