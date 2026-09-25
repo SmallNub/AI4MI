@@ -97,26 +97,14 @@ optimizer_params["sgd"] = {"optim": torch.optim.SGD, "args": {}}
 
 
 def img_transform(img):
-    img = img.convert("L")
-    img = np.array(img)[np.newaxis, ...]
-    img = img / 255  # max <= 1
+    img = img[np.newaxis, ...]
     img = torch.tensor(img, dtype=torch.float32)
     return img
 
-
 def gt_transform(K, img):
-    img = np.array(img)[...]
-    # The idea is that the classes are mapped to {0, 255} for binary cases
-    # {0, 85, 170, 255} for 4 classes
-    # {0, 51, 102, 153, 204, 255} for 6 classes
-    # Very sketchy but that works here and that simplifies visualization
-    img = img / (255 / (K - 1)) if K != 5 else img / 63  # max <= 1
-    img = torch.tensor(img, dtype=torch.int64)[
-        None, ...
-    ]  # Add one dimension to simulate batch
+    img = torch.tensor(img, dtype=torch.int64)[None, ...]
     img = class2one_hot(img, K=K)
     return img[0]
-
 
 def build_scheduler(optimizer, warmup_epochs, total_epochs):
     if optimizer is None:

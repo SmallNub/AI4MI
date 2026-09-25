@@ -42,10 +42,6 @@ from utils import map_, tqdm_
 def norm_arr(
     ct: np.ndarray, window_center: int = 40, window_width: int = 400
 ) -> np.ndarray:
-    """
-    Clips CT to a Soft Tissue/Mediastinum window, applies Z-score standardization,
-    and scales back to uint8 [0, 255] range for PNG saving.
-    """
     casted = ct.astype(np.float32)
 
     # Soft Tissue / Mediastinum HU Clipping (-160 HU to +240 HU)
@@ -56,15 +52,9 @@ def norm_arr(
     # Z-score Standardization
     mean = clipped.mean()
     std = clipped.std() + 1e-8
-    standardized = (clipped - mean) / std
-
-    # Min-Max re-scaling to [0, 255] for PNG output compatibility
-    shifted = standardized - standardized.min()
-    norm = shifted / (shifted.max() + 1e-8)
-    res = 255.0 * norm
-
-    return res.astype(np.uint8)
-
+    
+    return ((clipped - mean) / std).astype(np.float32)
+    
 
 def sanity_ct(ct, x, y, z, dx, dy, dz) -> bool:
     assert ct.dtype in [np.int16, np.int32], ct.dtype
@@ -129,27 +119,27 @@ def slice_patient(
     to_slice_gt = gt
 
     for idz in range(z):
-        img_slice = resize_(to_slice_ct[:, :, idz], shape).astype(np.uint8)
+        img_slice = resize_(to_slice_ct[:, :, idz], shape).astype(np.float32)
         gt_slice = resize_(to_slice_gt[:, :, idz], shape, order=0).astype(np.uint8)
         assert img_slice.shape == gt_slice.shape
-        gt_slice *= 63
+        # gt_slice *= 63
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
-        assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(
-            gt_slice
-        )
+        assert set(np.unique(gt_slice)) <= set([0, 1, 2, 3, 4]), np.unique(gt_slice)
 
         arrays: list[np.ndarray] = [img_slice, gt_slice]
         subfolders: list[str] = ["img", "gt"]
         assert len(arrays) == len(subfolders)
 
         for save_subfolder, data in zip(subfolders, arrays):
-            filename = f"{id_}_{idz:04d}.png"
+            filename = f"{id_}_{idz:04d}.npy"
             save_path: Path = Path(dest_path, save_subfolder)
             save_path.mkdir(parents=True, exist_ok=True)
+            
+            np.save(str(save_path / filename), data)
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=UserWarning)
-                imsave(str(save_path / filename), data)
+            # with warnings.catch_warnings():
+            #     warnings.filterwarnings("ignore", category=UserWarning)
+            #     imsave(str(save_path / filename), data)
 
     return dx, dy, dz
 

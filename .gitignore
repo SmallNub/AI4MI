@@ -1,4 +1,5 @@
 data/*
+scripts/slurm/*
 !data/*.b3sum
 !data/*.sha256
 results/

@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Callable
 import torch
 
-from PIL import Image
+import numpy as np
+# from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
@@ -41,15 +42,14 @@ def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
     img_path = root / subset / "img"
     full_path = root / subset / "gt"
 
-    images: list[Path] = sorted(img_path.glob("*.png"))
+    images: list[Path] = sorted(img_path.glob("*.npy"))
     full_labels: list[Path | None]
     if subset != "test":
-        full_labels = sorted(full_path.glob("*.png"))
+        full_labels = sorted(full_path.glob("*.npy"))
     else:
         full_labels = [None] * len(images)
 
     return list(zip(images, full_labels))
-
 
 class SliceDataset(Dataset):
     def __init__(
@@ -121,7 +121,7 @@ class SliceDataset(Dataset):
         for offset in range(-self.half_z, self.half_z + 1):
             valid_idx = self._get_valid_index(index, offset)
             img_path, _ = self.files[valid_idx]
-            img_tensors.append(self.img_transform(Image.open(img_path)))
+            img_tensors.append(self.img_transform(np.load(img_path)))
 
         if self.z_window == 1:
             stacked_img = img_tensors[0]
@@ -133,7 +133,7 @@ class SliceDataset(Dataset):
 
         if not self.test_mode:
             _, gt_path = self.files[index]
-            gt = self.gt_transform(Image.open(gt_path))
+            gt = self.gt_transform(np.load(gt_path))
 
             if self.spatial_transform is not None:
                 if self.z_window > 1:
