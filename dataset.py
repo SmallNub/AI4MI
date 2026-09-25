@@ -46,10 +46,7 @@ def norm_arr(ct: np.ndarray, window_center: int = 40, window_width: int = 400) -
     mean = clipped.mean()
     std = clipped.std() + 1e-8
     standardized = (clipped - mean) / std
-    shifted = standardized - standardized.min()
-    norm = shifted / (shifted.max() + 1e-8)
-    res = 255.0 * norm
-    return res.astype(np.uint8)
+    return standardized
 
 
 def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
@@ -270,7 +267,7 @@ class Segthor3DDataset(Dataset):
 
         norm_ct = norm_arr(ct)  # [H, W, Z] uint8
 
-        ct_tensor = torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0) / 255.0
+        ct_tensor = torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
 
         # Resize to fixed target depth [1, target_z, 256, 256]
         ct_resized = torch.nn.functional.interpolate(
