@@ -186,6 +186,7 @@ def setup(
 
     if is_3d_model:
         net = models_params[args.model]["net"](in_dim=1, out_dim=K, **models_params[args.model]["args"])
+        z_window = 1
     else:
         z_window = models_params[args.model]["args"].get("z_window", 1)
         net = models_params[args.model]["net"](z_window, K, **models_params[args.model]["args"])
@@ -510,11 +511,6 @@ def main():
         "--augment",
         action="store_true",
         help="Enable data augmentations.",
-    )
-    parser.add_argument(
-        "--drop_empty",
-        action="store_true",
-        help="Drop slices with no target labels (1, 2, 3, 4) during training.",
     )
     parser.add_argument(
         "--drop_empty",
