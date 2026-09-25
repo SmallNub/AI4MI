@@ -88,7 +88,7 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 8, "factor": 2, "z_window": 3},
+    "args": {"kernels": 8, "factor": 2, "z_window": 5},
 }
 
 optimizer_params: dict[str, dict[str, Any]] = {}

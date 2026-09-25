@@ -39,14 +39,29 @@ from skimage.transform import resize
 from utils import map_, tqdm_
 
 
-def norm_arr(img: np.ndarray) -> np.ndarray:
-    casted = img.astype(np.float32)
-    shifted = casted - casted.min()
-    norm = shifted / shifted.max()
-    res = 255 * norm
+def norm_arr(
+    ct: np.ndarray, window_center: int = 40, window_width: int = 400
+) -> np.ndarray:
+    """
+    Clips CT to a Soft Tissue/Mediastinum window, applies Z-score standardization,
+    and scales back to uint8 [0, 255] range for PNG saving.
+    """
+    casted = ct.astype(np.float32)
 
-    assert 0 == res.min(), res.min()
-    assert res.max() == 255, res.max()
+    # Soft Tissue / Mediastinum HU Clipping (-160 HU to +240 HU)
+    min_hu = window_center - (window_width / 2.0)
+    max_hu = window_center + (window_width / 2.0)
+    clipped = np.clip(casted, min_hu, max_hu)
+
+    # Z-score Standardization
+    mean = clipped.mean()
+    std = clipped.std() + 1e-8
+    standardized = (clipped - mean) / std
+
+    # Min-Max re-scaling to [0, 255] for PNG output compatibility
+    shifted = standardized - standardized.min()
+    norm = shifted / (shifted.max() + 1e-8)
+    res = 255.0 * norm
 
     return res.astype(np.uint8)
 
@@ -70,10 +85,6 @@ def sanity_ct(ct, x, y, z, dx, dy, dz) -> bool:
 def sanity_gt(gt, ct) -> bool:
     assert gt.shape == ct.shape
     assert gt.dtype in [np.uint8], gt.dtype
-
-    # Do the test on 3d: assume all organs are present..
-    # assert set(np.unique(gt)) == set(range(5))
-
     return True
 
 
@@ -98,7 +109,6 @@ def slice_patient(
     )
     nib_obj = nib.load(str(ct_path))
     ct: np.ndarray = np.asarray(nib_obj.dataobj)
-    # dx, dy, dz = nib_obj.header.get_zooms()
     x, y, z = ct.shape
     dx, dy, dz = nib_obj.header.get_zooms()
 
@@ -108,7 +118,6 @@ def slice_patient(
     if not test_mode:
         gt_path: Path = id_path / "GT.nii.gz"
         gt_nib = nib.load(str(gt_path))
-        # print(nib_obj.affine, gt_nib.affine)
         gt = np.asarray(gt_nib.dataobj)
         assert sanity_gt(gt, ct)
     else:
@@ -125,18 +134,16 @@ def slice_patient(
         assert img_slice.shape == gt_slice.shape
         gt_slice *= 63
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
-        # assert set(np.unique(gt_slice)) <= set(range(5))
         assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(
             gt_slice
         )
 
         arrays: list[np.ndarray] = [img_slice, gt_slice]
-
         subfolders: list[str] = ["img", "gt"]
         assert len(arrays) == len(subfolders)
+
         for save_subfolder, data in zip(subfolders, arrays):
             filename = f"{id_}_{idz:04d}.png"
-
             save_path: Path = Path(dest_path, save_subfolder)
             save_path.mkdir(parents=True, exist_ok=True)
 
@@ -175,10 +182,12 @@ def get_splits(
 
 
 def main(args: argparse.Namespace):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     src_path: Path = Path(args.source_dir)
     dest_path: Path = Path(args.dest_dir)
 
-    # Assume the clean up is done before calling the script
     assert src_path.exists()
     assert not dest_path.exists()
 
@@ -243,8 +252,6 @@ def get_args() -> argparse.Namespace:
         help="The number of cores to use for processing",
     )
     args = parser.parse_args()
-    random.seed(args.seed)
-
     print(args)
 
     return args
