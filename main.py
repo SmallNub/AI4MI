@@ -238,6 +238,7 @@ def setup(
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         augment=args.augment,
+        drop_empty=args.drop_empty,
         debug=args.debug,
         z_window=z_window,
     )
@@ -426,7 +427,7 @@ def runTraining(args):
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
         print(
-            f">> LR: {scheduler_net.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}"
+            f">> Epoch: {e} | LR: {scheduler_net.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}"
         )
 
         if current_dice > best_dice:
@@ -455,6 +456,11 @@ def main():
         "--augment",
         action="store_true",
         help="Enable data augmentations (small rotations, scaling, translations).",
+    )
+    parser.add_argument(
+        "--drop_empty",
+        action="store_true",
+        help="Drop slices with no target labels (1, 2, 3, 4) during training.",
     )
     parser.add_argument(
         "--batch_size",

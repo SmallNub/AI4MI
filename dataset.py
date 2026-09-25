@@ -25,6 +25,7 @@
 from pathlib import Path
 from typing import Callable
 import torch
+import numpy as np
 
 from PIL import Image
 from torch.utils.data import Dataset
@@ -62,6 +63,7 @@ class SliceDataset(Dataset):
         equalize=False,
         debug=False,
         z_window=1,
+        drop_empty=False,
     ):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
@@ -71,10 +73,26 @@ class SliceDataset(Dataset):
         self.test_mode: bool = subset == "test"
         self.z_window: int = z_window
         self.half_z: int = z_window // 2
+        self.drop_empty: bool = drop_empty
 
-        self.files = make_dataset(root_dir, subset)
+        self.full_files = make_dataset(root_dir, subset)
+
+        if self.drop_empty and not self.test_mode:
+            print(f">> Filtering empty slices (retaining only labels 1, 2, 3, 4) for {subset}...")
+            self.valid_indices = []
+            for idx, (_, gt_path) in enumerate(self.full_files):
+                if gt_path is not None:
+                    gt_arr = np.array(Image.open(gt_path))
+                    # Check if slice contains any foreground target organ (labels 1, 2, 3, 4)
+                    # Works for both raw classes [1, 2, 3, 4] and scaled values [63, 126, 189, 252]
+                    has_target_organs = np.any((gt_arr > 0) & (gt_arr <= 252))
+                    if has_target_organs:
+                        self.valid_indices.append(idx)
+        else:
+            self.valid_indices = list(range(len(self.full_files)))
+
         if debug:
-            self.files = self.files[:10]
+            self.valid_indices = self.valid_indices[:10]
 
         if self.augmentation and subset == "train":
             self.spatial_transform = v2.Compose(
@@ -91,36 +109,40 @@ class SliceDataset(Dataset):
             self.spatial_transform = None
 
         print(
-            f">> Created {subset} dataset with {len(self)} images (Augmentation: {self.spatial_transform is not None}, Z={self.z_window})..."
+            f">> Created {subset} dataset with {len(self)} images "
+            f"(Augmentation: {self.spatial_transform is not None}, Z={self.z_window}, Drop Empty: {self.drop_empty})..."
         )
 
-    def _get_valid_index(self, center_idx: int, offset: int) -> int:
-        """Prevents indexing out of bounds"""
-        target_idx = center_idx + offset
+    def _get_valid_index(self, center_full_idx: int, offset: int) -> int:
+        """Prevents indexing out of bounds against the complete file list"""
+        target_idx = center_full_idx + offset
 
-        if target_idx < 0 or target_idx >= len(self.files):
-            return center_idx
+        if target_idx < 0 or target_idx >= len(self.full_files):
+            return center_full_idx
 
-        center_stem = self.files[center_idx][0].stem
-        target_stem = self.files[target_idx][0].stem
+        center_stem = self.full_files[center_full_idx][0].stem
+        target_stem = self.full_files[target_idx][0].stem
 
         center_patient = center_stem.rsplit("_", 1)[0]
         target_patient = target_stem.rsplit("_", 1)[0]
 
         if center_patient != target_patient:
-            return center_idx
+            return center_full_idx
 
         return target_idx
 
     def __len__(self):
-        return len(self.files)
+        return len(self.valid_indices)
 
     def __getitem__(self, index) -> dict:
+        # Map dataset index to the actual position in full_files
+        full_idx = self.valid_indices[index]
         img_tensors = []
 
+        # Retrieve neighbor slices from the full sequential file list
         for offset in range(-self.half_z, self.half_z + 1):
-            valid_idx = self._get_valid_index(index, offset)
-            img_path, _ = self.files[valid_idx]
+            valid_full_idx = self._get_valid_index(full_idx, offset)
+            img_path, _ = self.full_files[valid_full_idx]
             img_tensors.append(self.img_transform(Image.open(img_path)))
 
         if self.z_window == 1:
@@ -128,11 +150,11 @@ class SliceDataset(Dataset):
         else:
             stacked_img = torch.stack(img_tensors, dim=0)
 
-        center_stem = self.files[index][0].stem
+        center_stem = self.full_files[full_idx][0].stem
         data_dict = {"images": stacked_img, "stems": center_stem}
 
         if not self.test_mode:
-            _, gt_path = self.files[index]
+            _, gt_path = self.full_files[full_idx]
             gt = self.gt_transform(Image.open(gt_path))
 
             if self.spatial_transform is not None:
