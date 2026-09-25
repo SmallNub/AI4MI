@@ -22,15 +22,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import random
 from pathlib import Path
 from typing import Callable
+
 import torch
 import numpy as np
-
+import nibabel as nib
 from PIL import Image
+from skimage.transform import resize
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
+
+
+def norm_arr(ct: np.ndarray, window_center: int = 40, window_width: int = 400) -> np.ndarray:
+    """Clips CT to Soft Tissue window and applies Z-score standardization."""
+    casted = ct.astype(np.float32)
+    min_hu = window_center - (window_width / 2.0)
+    max_hu = window_center + (window_width / 2.0)
+    clipped = np.clip(casted, min_hu, max_hu)
+    mean = clipped.mean()
+    std = clipped.std() + 1e-8
+    standardized = (clipped - mean) / std
+    shifted = standardized - standardized.min()
+    norm = shifted / (shifted.max() + 1e-8)
+    res = 255.0 * norm
+    return res.astype(np.uint8)
 
 
 def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
@@ -168,5 +186,127 @@ class SliceDataset(Dataset):
 
             data_dict["images"] = stacked_img
             data_dict["gts"] = gt
+
+        return data_dict
+
+
+class Segthor3DDataset(Dataset):
+    def __init__(
+        self,
+        subset: str,
+        root_dir: str,
+        img_transform: Callable = None,
+        gt_transform: Callable = None,
+        augment: bool = False,
+        equalize: bool = False,
+        drop_empty: bool = False,
+        debug: bool = False,
+        z_window: int = 1,
+    ):
+        assert subset in ["train", "val", "test"]
+
+        self.subset = subset
+        self.root_dir = Path(root_dir)
+        self.img_transform = img_transform
+        self.gt_transform = gt_transform
+        self.augment = augment
+        self.test_mode = subset == "test"
+        self.shape = (256, 256)  # Default SEGTHOR spatial shape
+
+        # 1. Folder routing
+        raw_folder = "test" if self.test_mode else "train"
+        self.data_path = self.root_dir / raw_folder
+
+        # 2. Filter directories to include ONLY valid patient folders containing .nii.gz files
+        all_ids = sorted(
+            [
+                p.name
+                for p in self.data_path.glob("*")
+                if p.is_dir()
+                and p.name not in ["img", "gt"]
+                and (p / f"{p.name}.nii.gz").exists()
+            ]
+        )
+
+        if debug:
+            all_ids = all_ids[:10]
+
+        # 3. Dynamic train/val split
+        if not self.test_mode:
+            random.shuffle(all_ids)
+
+            total_volumes = len(all_ids)
+            # Set validation set to 5 CT volumes
+            retains = 5 if total_volumes >= 5 else max(1, total_volumes)
+            fold = 0
+
+            val_slice = slice(fold * retains, (fold + 1) * retains)
+            val_ids = all_ids[val_slice]
+            train_ids = [x for x in all_ids if x not in val_ids]
+
+            self.files = train_ids if subset == "train" else val_ids
+        else:
+            self.files = all_ids
+
+        print(
+            f">> Created 3D {subset} dataset with {len(self.files)} volumes "
+            f"(Found {len(all_ids)} total valid patient folders)..."
+        )
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index: int) -> dict:
+        patient_id = self.files[index]
+        patient_path = self.data_path / patient_id
+
+        # Target 3D shape (Fixed Z, H, W across all volumes)
+        target_z = 128  # Choose a standard depth (e.g., 128, 160, 192)
+
+        # 1. Load CT Volume
+        ct_path = patient_path / f"{patient_id}.nii.gz"
+
+        ct_nii = nib.load(str(ct_path))
+        ct = np.asarray(ct_nii.dataobj)
+        affine = ct_nii.affine
+        orig_shape = ct.shape  # Capture native shape (e.g., [H, W, Z])
+
+        norm_ct = norm_arr(ct)  # [H, W, Z] uint8
+
+        ct_tensor = torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0) / 255.0
+
+        # Resize to fixed target depth [1, target_z, 256, 256]
+        ct_resized = torch.nn.functional.interpolate(
+            ct_tensor,
+            size=(target_z, self.shape[0], self.shape[1]),
+            mode="trilinear",
+            align_corners=False
+        ).squeeze(0)  # Shape: [1, 128, 256, 256]
+
+        data_dict = {
+            "images": ct_resized,
+            "stems": patient_id,
+            "affine": torch.from_numpy(affine).float(),
+            "orig_shape": torch.tensor(orig_shape),  # Pass original shape
+        }
+
+        # 2. Load Ground Truth
+        if not self.test_mode:
+            gt_path = patient_path / "GT.nii.gz"
+            gt = np.asarray(nib.load(str(gt_path)).dataobj)  # [H, W, Z]
+            gt_tensor = torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+
+            # Resize spatial dimensions [Z, 256, 256]
+            gt_resized = torch.nn.functional.interpolate(
+                gt_tensor,
+                size=(target_z, self.shape[0], self.shape[1]),
+                mode="nearest"
+            ).squeeze(0).squeeze(0).long()
+
+            # Convert to 5-channel boolean target mask [5, Z, 256, 256]
+            gt_one_hot = torch.nn.functional.one_hot(gt_resized, num_classes=5)
+            gt_one_hot = gt_one_hot.permute(3, 0, 1, 2).bool()
+
+            data_dict["gts"] = gt_one_hot
 
         return data_dict
