@@ -31,6 +31,7 @@ from shutil import copytree, rmtree
 
 import torch
 import numpy as np
+import nibabel as nib
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
@@ -41,11 +42,13 @@ from torch.optim.lr_scheduler import (
 )
 
 from functools import partial
+from skimage.transform import resize
 
-from dataset import SliceDataset
+from dataset import SliceDataset, Segthor3DDataset
 from ShallowNet import shallowCNN
 from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
 from ImprovedENet import ImprovedENet
+from ENet3D import ENet3D, AttentionENet3D
 from utils import (
     Dcm,
     class2one_hot,
@@ -61,11 +64,10 @@ from utils import (
 from losses import CrossEntropy, FocalLoss, GeneralizedDice, CompoundLoss
 
 datasets_params: dict[str, dict[str, Any]] = {}
-# K for the number of classes
-# Avoids the classes with C (often used for the number of Channel)
 datasets_params["TOY2"] = {"K": 2, "B": 2}
 datasets_params["SEGTHOR"] = {"K": 5, "B": 8}
 datasets_params["SEGTHOR_CLEAN"] = {"K": 5, "B": 8}
+datasets_params["segthor_train_full"] = {"K": 5, "B": 4}
 
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
@@ -90,6 +92,15 @@ models_params["ImprovedENet"] = {
     "net": ImprovedENet,
     "args": {"kernels": 8, "factor": 2, "z_window": 5},
 }
+models_params["ENet3D"] = {
+    "net": ENet3D,
+    "args": {"kernels": 16, "factor": 4},
+}
+models_params["AttentionENet3D"] = {
+    "net": AttentionENet3D,
+    "args": {"kernels": 16, "factor": 4},
+}
+
 
 optimizer_params: dict[str, dict[str, Any]] = {}
 optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999)}}
@@ -146,6 +157,7 @@ def setup(
     DataLoader,
     DataLoader,
     int,
+    bool,
 ]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
@@ -162,9 +174,15 @@ def setup(
     seed_everything(seed=args.seed, deterministic=args.deterministic)
 
     K: int = datasets_params[args.dataset]["K"]
-    z_window = models_params[args.model]["args"].get("z_window", 1)
+    is_3d_model = "3D" in args.model
 
-    net = models_params[args.model]["net"](z_window, K, **models_params[args.model]["args"])
+    if is_3d_model:
+        net = models_params[args.model]["net"](in_dim=1, out_dim=K, **models_params[args.model]["args"])
+        z_window = 1
+    else:
+        z_window = models_params[args.model]["args"].get("z_window", 1)
+        net = models_params[args.model]["net"](z_window, K, **models_params[args.model]["args"])
+
     net.init_weights()
     net.to(device)
 
@@ -176,9 +194,9 @@ def setup(
             print(">> Warning: torch.compile is not supported on this PyTorch version.")
 
     if args.mode == "full":
-        supervised_ids = list(range(K))  # Supervise both background and foreground
+        supervised_ids = list(range(K))
     elif args.mode in ["partial"] and args.dataset == "SEGTHOR":
-        supervised_ids = [0, 1, 3, 4]  # Do not supervise the heart (class 2)
+        supervised_ids = [0, 1, 3, 4]
     else:
         raise ValueError(args.mode, args.dataset)
 
@@ -214,34 +232,35 @@ def setup(
     warmup_epochs = getattr(args, "warmup_epochs", 5)
 
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
-    # scheduler_loss = build_scheduler(optimizer_loss, warmup_epochs, args.epochs)
 
-    # Dataset part
     B: int = args.batch_size if hasattr(args, "batch_size") else datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
 
-    train_set = SliceDataset(
+    DatasetClass = Segthor3DDataset if is_3d_model else SliceDataset
+
+    train_set = DatasetClass(
         "train",
         root_dir,
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         augment=args.augment,
+        drop_empty=args.drop_empty,
         debug=args.debug,
         z_window=z_window,
     )
     train_loader = DataLoader(
         train_set,
         batch_size=B,
-        num_workers=8,
+        num_workers=4 if is_3d_model else 8,
         prefetch_factor=2,
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed),
         shuffle=True,
         pin_memory=gpu,
-        drop_last=True,
+        drop_last=True if len(train_set) > B else False,
     )
 
-    val_set = SliceDataset(
+    val_set = DatasetClass(
         "val",
         root_dir,
         img_transform=img_transform,
@@ -252,7 +271,7 @@ def setup(
     val_loader = DataLoader(
         val_set,
         batch_size=B,
-        num_workers=8,
+        num_workers=4 if is_3d_model else 8,
         prefetch_factor=2,
         shuffle=False,
         pin_memory=gpu,
@@ -269,6 +288,7 @@ def setup(
         train_loader,
         val_loader,
         K,
+        is_3d_model,
     )
 
 
@@ -283,6 +303,7 @@ def runTraining(args):
         train_loader,
         val_loader,
         K,
+        is_3d_model,
     ) = setup(args)
 
     amp_enabled: bool = args.amp != "none" and device.type == "cuda"
@@ -302,6 +323,8 @@ def runTraining(args):
     best_dice: float = 0
 
     for e in range(args.epochs):
+        val_3d_predictions = []  # Store 3D volumes in memory if is_3d_model is True
+
         for m in ["train", "val"]:
             match m:
                 case "train":
@@ -335,7 +358,6 @@ def runTraining(args):
 
                     assert 0 <= img.min() and img.max() <= 1
                     B = img.shape[0]
-                    W, H = img.shape[-2:]
 
                     with torch.autocast(
                         device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
@@ -371,15 +393,35 @@ def runTraining(args):
                         scaler.update()
 
                     if m == "val":
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings("ignore", category=UserWarning)
-                            predicted_class: Tensor = probs2class(pred_probs)
-                            mult: int = 63 if K == 5 else (255 / (K - 1))
-                            save_images(
-                                predicted_class * mult,
-                                data["stems"],
-                                args.dest / f"iter{e:03d}" / m,
-                            )
+                        if is_3d_model:
+                            predicted_class: Tensor = probs2class(pred_probs)  # Shape: [B, Z, H, W]
+                            for b in range(B):
+                                vol = predicted_class[b].cpu().numpy().astype(np.uint8)
+                                vol = np.transpose(vol, (1, 2, 0))  # Convert [Z, H, W] to [H, W, Z]
+                                
+                                patient_affine = data["affine"][b].cpu().numpy()
+                                patient_orig_shape = data["orig_shape"][b].cpu().numpy()  # [H, W, Z]
+                                
+                                val_3d_predictions.append((vol, data["stems"][b], patient_affine, patient_orig_shape))
+                        else:
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings("ignore", category=UserWarning)
+                                predicted_class: Tensor = probs2class(pred_probs)
+                                mult: int = 63 if K == 5 else (255 / (K - 1))
+
+                                if predicted_class.dim() == 4:
+                                    mid_z = predicted_class.shape[1] // 2
+                                    save_images(
+                                        predicted_class[:, mid_z] * mult,
+                                        data["stems"],
+                                        args.dest / f"iter{e:03d}" / m,
+                                    )
+                                else:
+                                    save_images(
+                                        predicted_class * mult,
+                                        data["stems"],
+                                        args.dest / f"iter{e:03d}" / m,
+                                    )
 
                     j += B
                     postfix_dict: dict[str, str] = {
@@ -406,7 +448,6 @@ def runTraining(args):
         if scheduler_loss:
             scheduler_loss.step()
 
-        # Save results at each epoch
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
@@ -414,7 +455,7 @@ def runTraining(args):
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
         print(
-            f">> LR: {scheduler_net.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}"
+            f">> Epoch: {e} | LR: {scheduler_net.get_last_lr()[0]:.2e} | DSC: {current_dice:05.3f}"
         )
 
         if current_dice > best_dice:
@@ -427,7 +468,26 @@ def runTraining(args):
             best_folder = args.dest / "best_epoch"
             if best_folder.exists():
                 rmtree(best_folder)
-            copytree(args.dest / f"iter{e:03d}", Path(best_folder))
+
+            if is_3d_model:
+                best_folder.mkdir(parents=True, exist_ok=True)
+                for vol_3d, stem, patient_affine, orig_shape in val_3d_predictions:
+                    
+                    # Rescale prediction back to the patient's native dimensions
+                    resized_vol = resize(
+                        vol_3d.astype(float),
+                        tuple(orig_shape),
+                        order=0,  # Nearest neighbor is mandatory for segmentation masks
+                        mode="constant",
+                        preserve_range=True,
+                        anti_aliasing=False
+                    ).astype(np.uint8)
+                    
+                    # Save using the true patient affine and native shape
+                    nifti_img = nib.Nifti1Image(resized_vol, affine=patient_affine)
+                    nib.save(nifti_img, best_folder / f"{stem}.nii.gz")
+            else:
+                copytree(args.dest / f"iter{e:03d}", Path(best_folder))
 
             model_to_save = getattr(net, "_orig_mod", net)
             torch.save(model_to_save, args.dest / "bestmodel.pkl")
@@ -442,46 +502,46 @@ def main():
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Enable data augmentations (small rotations, scaling, translations).",
+        help="Enable data augmentations.",
+    )
+    parser.add_argument(
+        "--drop_empty",
+        action="store_true",
+        help="Drop slices with no target labels (1, 2, 3, 4) during training.",
     )
     parser.add_argument(
         "--batch_size",
-        default=8,
+        default=1,
         type=int,
-        help="Batch size for training and validation.",
+        help="Batch size (set to 1 or 2 for 3D volumes to prevent CUDA OOM).",
     )
-    parser.add_argument("--model", default="ENet", choices=models_params.keys())
+    parser.add_argument("--model", default="ENet3D", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument(
         "--warmup-epochs",
         default=5,
         type=int,
-        help="Number of initial epochs for linear learning rate warmup (default: 5). Set to 0 to disable.",
     )
     parser.add_argument(
         "--loss",
         default="ce",
         choices=["ce", "gdl", "compound"],
-        help="Loss function to use: 'ce', 'gdl', or 'compound' (weighted mix).",
     )
     parser.add_argument(
         "--use_focal",
         action="store_true",
-        help="Use Focal Loss instead of Cross-Entropy Loss.",
     )
     parser.add_argument(
         "--clip-grad",
         default=1.0,
         type=float,
-        help="Maximum gradient norm for gradient clipping (set <= 0 to disable). Default: 1.0",
     )
     parser.add_argument("--mode", default="full", choices=["partial", "full"])
     parser.add_argument(
         "--dest",
         type=Path,
         required=True,
-        help="Destination directory to save the results (predictions and weights).",
     )
 
     parser.add_argument("--gpu", action="store_true")
@@ -489,36 +549,29 @@ def main():
         "--amp",
         default="bf16",
         choices=["none", "fp16", "bf16"],
-        help="Automatic Mixed Precision mode (default: bf16).",
     )
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="Use torch.compile to optimize the neural network execution.",
     )
     parser.add_argument(
         "--no-tf32",
         dest="tf32",
         default=True,
         action="store_false",
-        help="Disable TensorFloat-32 (TF32) execution precision.",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Keep only a fraction (10 samples) of the datasets, "
-        "to test the logics around epochs and logging easily.",
     )
     parser.add_argument(
         "--seed",
         default=42,
         type=int,
-        help="Random seed for reproducibility (default: 42).",
     )
     parser.add_argument(
         "--deterministic",
         action="store_true",
-        help="Enforce strict CUDA determinism (disables cuDNN benchmarking).",
     )
 
     args = parser.parse_args()

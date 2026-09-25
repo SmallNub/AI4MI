@@ -17,8 +17,8 @@ source ai4mi/bin/activate
 
 echo "Data Preprocessing..."
 
-rm -rf data/SEGTHOR
-make data/SEGTHOR
+# rm -rf data/SEGTHOR
+# make data/SEGTHOR
 
 MODEL="imp100"
 
@@ -44,14 +44,14 @@ python stitch.py --data_folder results/segthor/$MODEL/best_epoch/val \
     --dest_folder volumes/segthor/$MODEL \
     --num_classes 255 \
     --grp_regex "(Patient_\d\d)_\d\d\d\d" \
-    --source_scan_pattern "data/segthor/train/{id_}/GT.nii.gz"
+    --source_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz"
 
 echo "Computing Metrics..."
 
 python metrics.py \
     --data_folder results/segthor/$MODEL/best_epoch/val \
     --volumes_folder volumes/segthor/$MODEL \
-    --target_pattern "data/segthor/train/{id_}/GT.nii.gz" \
+    --target_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
     --grp_regex "(Patient_\d\d)_\d\d\d\d" \
     --num_classes 5 \
     --backend distorch \
