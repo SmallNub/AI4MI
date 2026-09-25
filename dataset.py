@@ -37,7 +37,9 @@ from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
 
 
-def norm_arr(ct: np.ndarray, window_center: int = 40, window_width: int = 400) -> np.ndarray:
+def norm_arr(
+    ct: np.ndarray, window_center: int = 40, window_width: int = 400
+) -> np.ndarray:
     """Clips CT to Soft Tissue window and applies Z-score standardization."""
     casted = ct.astype(np.float32)
     min_hu = window_center - (window_width / 2.0)
@@ -67,6 +69,7 @@ def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
 
     return list(zip(images, full_labels))
 
+
 class SliceDataset(Dataset):
     def __init__(
         self,
@@ -93,7 +96,9 @@ class SliceDataset(Dataset):
         self.full_files = make_dataset(root_dir, subset)
 
         if self.drop_empty and not self.test_mode:
-            print(f">> Filtering empty slices (retaining only labels 1, 2, 3, 4) for {subset}...")
+            print(
+                f">> Filtering empty slices (retaining only labels 1, 2, 3, 4) for {subset}..."
+            )
             self.valid_indices = []
             for idx, (_, gt_path) in enumerate(self.full_files):
                 if gt_path is not None:
@@ -230,7 +235,6 @@ class Segthor3DDataset(Dataset):
             random.shuffle(all_ids)
 
             total_volumes = len(all_ids)
-            # Set validation set to 5 CT volumes
             retains = 5 if total_volumes >= 5 else max(1, total_volumes)
             fold = 0
 
@@ -244,7 +248,7 @@ class Segthor3DDataset(Dataset):
 
         print(
             f">> Created 3D {subset} dataset with {len(self.files)} volumes "
-            f"(Found {len(all_ids)} total valid patient folders)..."
+            f"(Augmentation: {self.augment and subset == 'train'}, Found {len(all_ids)} total valid patient folders)..."
         )
 
     def __len__(self):
@@ -254,53 +258,120 @@ class Segthor3DDataset(Dataset):
         patient_id = self.files[index]
         patient_path = self.data_path / patient_id
 
-        # Target 3D shape (Fixed Z, H, W across all volumes)
-        target_z = 128  # Choose a standard depth (e.g., 128, 160, 192)
+        target_z = 128  # Standard depth
 
         # 1. Load CT Volume
         ct_path = patient_path / f"{patient_id}.nii.gz"
-
         ct_nii = nib.load(str(ct_path))
         ct = np.asarray(ct_nii.dataobj)
         affine = ct_nii.affine
-        orig_shape = ct.shape  # Capture native shape (e.g., [H, W, Z])
+        orig_shape = ct.shape
 
-        norm_ct = norm_arr(ct)  # [H, W, Z] uint8
-
-        ct_tensor = torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        norm_ct = norm_arr(ct)  # [H, W, Z]
+        ct_tensor = (
+            torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+        )
 
         # Resize to fixed target depth [1, target_z, 256, 256]
         ct_resized = torch.nn.functional.interpolate(
             ct_tensor,
             size=(target_z, self.shape[0], self.shape[1]),
             mode="trilinear",
-            align_corners=False
-        ).squeeze(0)  # Shape: [1, 128, 256, 256]
+            align_corners=False,
+        ).squeeze(
+            0
+        )  # Shape: [1, 128, 256, 256]
 
         data_dict = {
             "images": ct_resized,
             "stems": patient_id,
             "affine": torch.from_numpy(affine).float(),
-            "orig_shape": torch.tensor(orig_shape),  # Pass original shape
+            "orig_shape": torch.tensor(orig_shape),
         }
 
         # 2. Load Ground Truth
         if not self.test_mode:
             gt_path = patient_path / "GT.nii.gz"
             gt = np.asarray(nib.load(str(gt_path)).dataobj)  # [H, W, Z]
-            gt_tensor = torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+            gt_tensor = (
+                torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+            )
 
-            # Resize spatial dimensions [Z, 256, 256]
-            gt_resized = torch.nn.functional.interpolate(
-                gt_tensor,
-                size=(target_z, self.shape[0], self.shape[1]),
-                mode="nearest"
-            ).squeeze(0).squeeze(0).long()
+            gt_resized = (
+                torch.nn.functional.interpolate(
+                    gt_tensor,
+                    size=(target_z, self.shape[0], self.shape[1]),
+                    mode="nearest",
+                )
+                .squeeze(0)
+                .squeeze(0)
+                .long()
+            )
 
-            # Convert to 5-channel boolean target mask [5, Z, 256, 256]
             gt_one_hot = torch.nn.functional.one_hot(gt_resized, num_classes=5)
-            gt_one_hot = gt_one_hot.permute(3, 0, 1, 2).bool()
+            gt_one_hot = gt_one_hot.permute(
+                3, 0, 1, 2
+            ).float()  # Switch to float for interpolation, back to bool later
 
-            data_dict["gts"] = gt_one_hot
+            # --- 3D AUGMENTATIONS (Train Only) ---
+            if self.augment and self.subset == "train":
+                # 1. Random Scaling and Translation via Affine Grid
+                if random.random() > 0.3:
+                    # Sample random scale (e.g., between 0.9 and 1.1) and translation offset
+                    scale = random.uniform(0.9, 1.1)
+                    tx = random.uniform(-0.1, 0.1)
+                    ty = random.uniform(-0.1, 0.1)
+                    tz = random.uniform(-0.1, 0.1)
+
+                    # Build a 3D affine matrix [1, 3, 4]
+                    theta = torch.tensor(
+                        [[scale, 0, 0, tx], [0, scale, 0, ty], [0, 0, scale, tz]],
+                        dtype=torch.float32,
+                    ).unsqueeze(0)
+
+                    grid = torch.nn.functional.affine_grid(
+                        theta,
+                        [1, 1, target_z, self.shape[0], self.shape[1]],
+                        align_corners=False,
+                    )
+                    ct_resized = torch.nn.functional.grid_sample(
+                        ct_resized.unsqueeze(0),
+                        grid,
+                        mode="bilinear",
+                        padding_mode="border",
+                        align_corners=False,
+                    ).squeeze(0)
+
+                    gt_one_hot = torch.nn.functional.grid_sample(
+                        gt_one_hot.unsqueeze(0),
+                        grid,
+                        mode="nearest",
+                        padding_mode="zeros",
+                        align_corners=False,
+                    ).squeeze(0)
+
+                if random.random() > 0.5:
+                    k = random.choice([1, 2, 3])
+                    ct_resized = torch.rot90(ct_resized, k, dims=[2, 3])
+                    gt_one_hot = torch.rot90(gt_one_hot, k, dims=[2, 3])
+
+                if random.random() > 0.5:
+                    ct_resized = torch.flip(ct_resized, dims=[2])
+                    gt_one_hot = torch.flip(gt_one_hot, dims=[2])
+
+                if random.random() > 0.5:
+                    ct_resized = torch.flip(ct_resized, dims=[3])
+                    gt_one_hot = torch.flip(gt_one_hot, dims=[3])
+
+                # 3. Random Gaussian Noise (Applied ONLY to images)
+                if random.random() > 0.5:
+                    noise = (
+                        torch.randn_like(ct_resized) * 0.1
+                    )  # Adjust standard deviation as needed
+                    ct_resized = ct_resized + noise
+
+            # Convert ground truth back to boolean format for your loss function
+            data_dict["images"] = ct_resized
+            data_dict["gts"] = gt_one_hot.bool()
 
         return data_dict
