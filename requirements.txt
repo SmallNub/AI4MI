@@ -3,7 +3,6 @@ cuda-bindings==13.3.1
 cuda-pathfinder==1.8.0
 cuda-toolkit==13.0.3.0
 cycler==0.12.1
-distorch @ git+https://github.com/jeromerony/distorch.git@c6d0af59597473ff7cb9c0d6ebb4730f9a7b237e
 filelock==3.32.5
 fonttools==4.64.0
 fsspec==2026.7.0
