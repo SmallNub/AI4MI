@@ -280,6 +280,7 @@ def setup(
         drop_empty=args.drop_empty,
         debug=args.debug,
         z_window=z_window,
+        resample=args.resample
     )
     train_loader = DataLoader(
         train_set,
@@ -300,6 +301,7 @@ def setup(
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
         z_window=z_window,
+        resample=args.resample
     )
     val_loader = DataLoader(
         val_set,
@@ -619,6 +621,11 @@ def main():
         "--deterministic",
         action="store_true",
     )
+    parser.add_argument(
+            "--resample",
+            action="store_true",
+        )
+    
 
     args = parser.parse_args()
 

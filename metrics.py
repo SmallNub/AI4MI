@@ -13,10 +13,43 @@ from typing import Match, Pattern
 import torch
 import distorch
 import nibabel as nib
+import SimpleITK as sitk
 import numpy as np
 import pandas as pd
 from scipy import ndimage
 from tqdm import tqdm
+
+
+def resample_sitk_image(
+    image: sitk.Image,
+    target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    is_mask: bool = False,
+) -> sitk.Image:
+    """Resamples a SimpleITK image to a target physical spacing."""
+    original_spacing = image.GetSpacing()
+    original_size = image.GetSize()
+
+    if np.allclose(original_spacing, target_spacing):
+        return image
+
+    new_size = [
+        int(round(original_size[i] * original_spacing[i] / target_spacing[i]))
+        for i in range(3)
+    ]
+
+    resample = sitk.ResampleImageFilter()
+    resample.SetOutputSpacing(target_spacing)
+    resample.SetSize(new_size)
+    resample.SetOutputDirection(image.GetDirection())
+    resample.SetOutputOrigin(image.GetOrigin())
+    resample.SetTransform(sitk.Transform())
+
+    if is_mask:
+        resample.SetInterpolator(sitk.sitkNearestNeighbor)
+    else:
+        resample.SetInterpolator(sitk.sitkLinear)
+
+    return resample.Execute(image)
 
 
 def _surface(mask: np.ndarray) -> np.ndarray:
@@ -298,7 +331,6 @@ def main() -> None:
         description="Batch compute 3D segmentation metrics across patients"
     )
 
-    # Can scan either PNG slice directory OR stitched volumes directory directly
     parser.add_argument(
         "--data_folder",
         type=Path,
@@ -315,7 +347,7 @@ def main() -> None:
         "--target_pattern",
         type=str,
         required=True,
-        help="Pattern for target NIfTI files using {id_} placeholder (e.g. 'data/segthor_part1/train/{id_}/GT.nii.gz')",
+        help="Pattern for target NIfTI files using {id_} placeholder",
     )
     parser.add_argument(
         "--grp_regex",
@@ -353,6 +385,18 @@ def main() -> None:
         default=None,
         help="Optional path to save results as CSV",
     )
+    parser.add_argument(
+        "--resample",
+        action="store_true",
+        help="Resample prediction and target to target_spacing before computing metrics.",
+    )
+    parser.add_argument(
+        "--target_spacing",
+        type=float,
+        nargs=3,
+        default=(1.0, 1.0, 1.0),
+        help="Target physical spacing for resampling if --resample is enabled.",
+    )
     args = parser.parse_args()
 
     v_folder = args.volumes_folder if args.volumes_folder else args.data_folder
@@ -365,7 +409,6 @@ def main() -> None:
         matches: list[Match] = [grouping_regex.match(s) for s in stems if grouping_regex.match(s)]  # type: ignore
         unique_patients: list[str] = sorted(list({match.group(1) for match in matches}))
     else:
-        # Fallback: scan for NIfTI volumes matching grp_regex directly
         nii_files = list(v_folder.glob("*.nii.gz"))
         unique_patients = []
         for p in nii_files:
@@ -401,13 +444,29 @@ def main() -> None:
             )
             continue
 
-        prediction, spacing = _load_volume(pred_path)
-        target, target_spacing = _load_volume(target_path)
+        # Conditional loading: Resample via SimpleITK or fall back to original loading
+        if args.resample:
+            pred_sitk = sitk.ReadImage(str(pred_path))
+            target_sitk = sitk.ReadImage(str(target_path))
 
-        if not np.allclose(spacing, target_spacing):
-            raise ValueError(
-                f"Spacing mismatch for patient {patient_id}: {spacing} vs {target_spacing}"
+            pred_sitk = resample_sitk_image(
+                pred_sitk, target_spacing=tuple(args.target_spacing), is_mask=True
             )
+            target_sitk = resample_sitk_image(
+                target_sitk, target_spacing=tuple(args.target_spacing), is_mask=True
+            )
+
+            prediction = sitk.GetArrayFromImage(pred_sitk)
+            target = sitk.GetArrayFromImage(target_sitk)
+            spacing = tuple(float(v) for v in pred_sitk.GetSpacing())
+        else:
+            prediction, spacing = _load_volume(pred_path)
+            target, target_spacing = _load_volume(target_path)
+
+            if not np.allclose(spacing, target_spacing):
+                raise ValueError(
+                    f"Spacing mismatch for patient {patient_id}: {spacing} vs {target_spacing}"
+                )
 
         results = volume_metrics(
             prediction,

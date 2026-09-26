@@ -26,13 +26,15 @@ import random
 from pathlib import Path
 from typing import Callable
 
-import nibabel as nib
 import numpy as np
 import torch
-import torchvision.transforms.v2 as v2
+import nibabel as nib
+import SimpleITK as sitk
 from PIL import Image
+from skimage.transform import resize
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
+import torchvision.transforms.v2 as v2
 
 
 def norm_arr(
@@ -47,6 +49,38 @@ def norm_arr(
     std = clipped.std() + 1e-8
     standardized = (clipped - mean) / std
     return standardized
+
+
+def resample_sitk_image(
+    image: sitk.Image,
+    target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    is_mask: bool = False,
+) -> sitk.Image:
+    """Resamples a SimpleITK image to a target physical spacing."""
+    original_spacing = image.GetSpacing()
+    original_size = image.GetSize()
+
+    if np.allclose(original_spacing, target_spacing):
+        return image
+
+    new_size = [
+        int(round(original_size[i] * original_spacing[i] / target_spacing[i]))
+        for i in range(3)
+    ]
+
+    resample = sitk.ResampleImageFilter()
+    resample.SetOutputSpacing(target_spacing)
+    resample.SetSize(new_size)
+    resample.SetOutputDirection(image.GetDirection())
+    resample.SetOutputOrigin(image.GetOrigin())
+    resample.SetTransform(sitk.Transform())
+
+    if is_mask:
+        resample.SetInterpolator(sitk.sitkNearestNeighbor)
+    else:
+        resample.SetInterpolator(sitk.sitkLinear)
+
+    return resample.Execute(image)
 
 
 def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
@@ -101,8 +135,6 @@ class SliceDataset(Dataset):
             for idx, (_, gt_path) in enumerate(self.full_files):
                 if gt_path is not None:
                     gt_arr = np.array(Image.open(gt_path))
-                    # Check if slice contains any foreground target organ (labels 1, 2, 3, 4)
-                    # Works for both raw classes [1, 2, 3, 4] and scaled values [63, 126, 189, 252]
                     has_target_organs = np.any((gt_arr > 0) & (gt_arr <= 252))
                     if has_target_organs:
                         self.valid_indices.append(idx)
@@ -132,7 +164,6 @@ class SliceDataset(Dataset):
         )
 
     def _get_valid_index(self, center_full_idx: int, offset: int) -> int:
-        """Prevents indexing out of bounds against the complete file list"""
         target_idx = center_full_idx + offset
 
         if target_idx < 0 or target_idx >= len(self.full_files):
@@ -153,32 +184,24 @@ class SliceDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, index) -> dict:
-        center_full_idx = self.valid_indices[index]
-
         img_tensors = []
+
         for offset in range(-self.half_z, self.half_z + 1):
-            valid_idx = self._get_valid_index(center_full_idx, offset)
-            img_path, _ = self.full_files[valid_idx]
-            img_data = np.load(img_path)
-            if self.img_transform is not None:
-                img_data = self.img_transform(img_data)
-            img_tensors.append(img_data)
+            valid_idx = self._get_valid_index(index, offset)
+            img_path, _ = self.files[valid_idx]
+            img_tensors.append(self.img_transform(np.load(img_path)))
 
         if self.z_window == 1:
             stacked_img = img_tensors[0]
         else:
             stacked_img = torch.stack(img_tensors, dim=0)
 
-        center_stem = self.full_files[center_full_idx][0].stem
+        center_stem = self.files[index][0].stem
         data_dict = {"images": stacked_img, "stems": center_stem}
 
         if not self.test_mode:
-            _, gt_path = self.full_files[center_full_idx]
-            gt_data = np.load(gt_path)
-            if self.gt_transform is not None:
-                gt_data = self.gt_transform(gt_data)
-
-            gt = gt_data
+            _, gt_path = self.files[index]
+            gt = self.gt_transform(np.load(gt_path))
 
             if self.spatial_transform is not None:
                 if self.z_window > 1:
@@ -207,6 +230,8 @@ class Segthor3DDataset(Dataset):
         drop_empty: bool = False,
         debug: bool = False,
         z_window: int = 1,
+        resample: bool = False,
+        target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
     ):
         assert subset in ["train", "val", "test"]
 
@@ -217,6 +242,8 @@ class Segthor3DDataset(Dataset):
         self.augment = augment
         self.test_mode = subset == "test"
         self.shape = (256, 256)  # Default SEGTHOR spatial shape
+        self.resample = resample
+        self.target_spacing = target_spacing
 
         # 1. Folder routing
         raw_folder = "test" if self.test_mode else "train"
@@ -254,7 +281,7 @@ class Segthor3DDataset(Dataset):
 
         print(
             f">> Created 3D {subset} dataset with {len(self.files)} volumes "
-            f"(Augmentation: {self.augment and subset == 'train'}, Found {len(all_ids)} total valid patient folders)..."
+            f"(Resampling: {self.resample}, Spacing: {self.target_spacing if self.resample else 'N/A'}, Found {len(all_ids)} total valid patient folders)..."
         )
 
     def __len__(self):
@@ -268,25 +295,39 @@ class Segthor3DDataset(Dataset):
 
         # 1. Load CT Volume
         ct_path = patient_path / f"{patient_id}.nii.gz"
-        ct_nii = nib.load(str(ct_path))
-        ct = np.asarray(ct_nii.dataobj)
-        affine = ct_nii.affine
-        orig_shape = ct.shape
+        
+        if self.resample:
+            ct_sitk = sitk.ReadImage(str(ct_path))
+            ct_processed = resample_sitk_image(ct_sitk, target_spacing=self.target_spacing, is_mask=False)
+            ct_arr_z_hw = sitk.GetArrayFromImage(ct_processed)  # [Z, H, W]
+            ct = np.transpose(ct_arr_z_hw, (1, 2, 0))  # Convert to [H, W, Z] to match Nibabel convention
+            
+            spacing = ct_processed.GetSpacing()
+            direction = ct_processed.GetDirection()
+            origin = ct_processed.GetOrigin()
+            affine = np.eye(4)
+            affine[:3, :3] = np.array(direction).reshape(3, 3) @ np.diag(spacing)
+            affine[:3, 3] = origin
+            orig_shape = ct.shape
+        else:
+            # Original Nibabel implementation
+            ct_nii = nib.load(str(ct_path))
+            ct = np.asarray(ct_nii.dataobj)
+            affine = ct_nii.affine
+            orig_shape = ct.shape
 
         norm_ct = norm_arr(ct)  # [H, W, Z]
         ct_tensor = (
             torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
         )
 
-        # Resize to fixed target depth [1, 1, target_z, 256, 256]
+        # Resize to fixed target depth [1, target_z, 256, 256]
         ct_resized = torch.nn.functional.interpolate(
             ct_tensor,
             size=(target_z, self.shape[0], self.shape[1]),
             mode="trilinear",
             align_corners=False,
-        ).squeeze(
-            0
-        )  # Shape: [1, 128, 256, 256]
+        ).squeeze(0)  # Shape: [1, 128, 256, 256]
 
         data_dict = {
             "images": ct_resized,
@@ -298,7 +339,16 @@ class Segthor3DDataset(Dataset):
         # 2. Load Ground Truth
         if not self.test_mode:
             gt_path = patient_path / "GT.nii.gz"
-            gt = np.asarray(nib.load(str(gt_path)).dataobj)  # [H, W, Z]
+            
+            if self.resample:
+                gt_sitk = sitk.ReadImage(str(gt_path))
+                gt_processed = resample_sitk_image(gt_sitk, target_spacing=self.target_spacing, is_mask=True)
+                gt_arr_z_hw = sitk.GetArrayFromImage(gt_processed)  # [Z, H, W]
+                gt = np.transpose(gt_arr_z_hw, (1, 2, 0))  # Convert to [H, W, Z]
+            else:
+                # Original Nibabel implementation
+                gt = np.asarray(nib.load(str(gt_path)).dataobj)  # [H, W, Z]
+
             gt_tensor = (
                 torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
             )
@@ -329,11 +379,7 @@ class Segthor3DDataset(Dataset):
                     tz = random.uniform(-0.1, 0.1)
 
                     theta = torch.tensor(
-                        [
-                            [scale, 0, 0, tx],
-                            [0, scale, 0, ty],
-                            [0, 0, scale, tz],
-                        ],
+                        [[scale, 0, 0, tx], [0, scale, 0, ty], [0, 0, scale, tz]],
                         dtype=torch.float32,
                     ).unsqueeze(0)
 
@@ -373,10 +419,12 @@ class Segthor3DDataset(Dataset):
 
                 # 3. Random Gaussian Noise (Applied ONLY to images)
                 if random.random() > 0.5:
-                    noise = torch.randn_like(ct_resized) * 0.1
+                    noise = (
+                        torch.randn_like(ct_resized) * 0.1
+                    )
                     ct_resized = ct_resized + noise
 
-            # Convert ground truth back to boolean format for loss functions
+            # Convert ground truth back to boolean format for your loss function
             data_dict["images"] = ct_resized
             data_dict["gts"] = gt_one_hot.bool()
 
