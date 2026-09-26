@@ -47,3 +47,4 @@ torchvision==0.28.0
 tqdm==4.70.0
 triton==3.7.1
 typing_extensions==4.16.0
+torchinfo=1.8.0

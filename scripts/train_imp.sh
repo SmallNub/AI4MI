@@ -17,8 +17,8 @@ source ai4mi/bin/activate
 
 echo "Data Preprocessing..."
 
-# rm -rf data/SEGTHOR
-# make data/SEGTHOR
+rm -rf data/SEGTHOR
+make data/SEGTHOR
 
 MODEL="imp100"
 
@@ -33,6 +33,7 @@ python -O main.py \
     --lr 0.001 \
     --epochs 100 \
     --warmup-epochs 3 \
+    --dataset SEGTHOR \
     --dest results/segthor/$MODEL \
     --gpu \
     --compile \

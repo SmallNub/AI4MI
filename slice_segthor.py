@@ -52,9 +52,9 @@ def norm_arr(
     # Z-score Standardization
     mean = clipped.mean()
     std = clipped.std() + 1e-8
-    
+
     return ((clipped - mean) / std).astype(np.float32)
-    
+
 
 def sanity_ct(ct, x, y, z, dx, dy, dz) -> bool:
     assert ct.dtype in [np.int16, np.int32], ct.dtype
@@ -134,7 +134,7 @@ def slice_patient(
             filename = f"{id_}_{idz:04d}.npy"
             save_path: Path = Path(dest_path, save_subfolder)
             save_path.mkdir(parents=True, exist_ok=True)
-            
+
             np.save(str(save_path / filename), data)
 
             # with warnings.catch_warnings():

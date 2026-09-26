@@ -26,15 +26,13 @@ import random
 from pathlib import Path
 from typing import Callable
 
+import nibabel as nib
 import numpy as np
 import torch
-import numpy as np
-import nibabel as nib
+import torchvision.transforms.v2 as v2
 from PIL import Image
-from skimage.transform import resize
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
-import torchvision.transforms.v2 as v2
 
 
 def norm_arr(
@@ -155,24 +153,32 @@ class SliceDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, index) -> dict:
-        img_tensors = []
+        center_full_idx = self.valid_indices[index]
 
+        img_tensors = []
         for offset in range(-self.half_z, self.half_z + 1):
-            valid_idx = self._get_valid_index(index, offset)
-            img_path, _ = self.files[valid_idx]
-            img_tensors.append(self.img_transform(np.load(img_path)))
+            valid_idx = self._get_valid_index(center_full_idx, offset)
+            img_path, _ = self.full_files[valid_idx]
+            img_data = np.load(img_path)
+            if self.img_transform is not None:
+                img_data = self.img_transform(img_data)
+            img_tensors.append(img_data)
 
         if self.z_window == 1:
             stacked_img = img_tensors[0]
         else:
             stacked_img = torch.stack(img_tensors, dim=0)
 
-        center_stem = self.files[index][0].stem
+        center_stem = self.full_files[center_full_idx][0].stem
         data_dict = {"images": stacked_img, "stems": center_stem}
 
         if not self.test_mode:
-            _, gt_path = self.files[index]
-            gt = self.gt_transform(np.load(gt_path))
+            _, gt_path = self.full_files[center_full_idx]
+            gt_data = np.load(gt_path)
+            if self.gt_transform is not None:
+                gt_data = self.gt_transform(gt_data)
+
+            gt = gt_data
 
             if self.spatial_transform is not None:
                 if self.z_window > 1:
@@ -272,7 +278,7 @@ class Segthor3DDataset(Dataset):
             torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
         )
 
-        # Resize to fixed target depth [1, target_z, 256, 256]
+        # Resize to fixed target depth [1, 1, target_z, 256, 256]
         ct_resized = torch.nn.functional.interpolate(
             ct_tensor,
             size=(target_z, self.shape[0], self.shape[1]),
@@ -317,15 +323,17 @@ class Segthor3DDataset(Dataset):
             if self.augment and self.subset == "train":
                 # 1. Random Scaling and Translation via Affine Grid
                 if random.random() > 0.3:
-                    # Sample random scale (e.g., between 0.9 and 1.1) and translation offset
                     scale = random.uniform(0.9, 1.1)
                     tx = random.uniform(-0.1, 0.1)
                     ty = random.uniform(-0.1, 0.1)
                     tz = random.uniform(-0.1, 0.1)
 
-                    # Build a 3D affine matrix [1, 3, 4]
                     theta = torch.tensor(
-                        [[scale, 0, 0, tx], [0, scale, 0, ty], [0, 0, scale, tz]],
+                        [
+                            [scale, 0, 0, tx],
+                            [0, scale, 0, ty],
+                            [0, 0, scale, tz],
+                        ],
                         dtype=torch.float32,
                     ).unsqueeze(0)
 
@@ -365,12 +373,10 @@ class Segthor3DDataset(Dataset):
 
                 # 3. Random Gaussian Noise (Applied ONLY to images)
                 if random.random() > 0.5:
-                    noise = (
-                        torch.randn_like(ct_resized) * 0.1
-                    )  # Adjust standard deviation as needed
+                    noise = torch.randn_like(ct_resized) * 0.1
                     ct_resized = ct_resized + noise
 
-            # Convert ground truth back to boolean format for your loss function
+            # Convert ground truth back to boolean format for loss functions
             data_dict["images"] = ct_resized
             data_dict["gts"] = gt_one_hot.bool()
 

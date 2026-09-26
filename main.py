@@ -43,11 +43,13 @@ from torch.optim.lr_scheduler import (
 
 from functools import partial
 from skimage.transform import resize
+from torchinfo import summary
 
 from dataset import SliceDataset, Segthor3DDataset
 from ShallowNet import shallowCNN
 from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
 from ImprovedENet import ImprovedENet
+from ImprovedENet3D import ImprovedENet3D
 from ENet3D import ENet3D, AttentionENet3D
 from utils import (
     Dcm,
@@ -90,7 +92,7 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 8, "factor": 2, "z_window": 5},
+    "args": {"kernels": 8, "factor": 2, "z_window": 15},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,
@@ -100,7 +102,10 @@ models_params["AttentionENet3D"] = {
     "net": AttentionENet3D,
     "args": {"kernels": 16, "factor": 4},
 }
-
+models_params["ImprovedENet3D"] = {
+    "net": ImprovedENet3D,
+    "args": {"kernels": 8, "factor": 2},
+}
 
 optimizer_params: dict[str, dict[str, Any]] = {}
 optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999)}}
@@ -112,10 +117,12 @@ def img_transform(img):
     img = torch.tensor(img, dtype=torch.float32)
     return img
 
+
 def gt_transform(K, img):
     img = torch.tensor(img, dtype=torch.int64)[None, ...]
     img = class2one_hot(img, K=K)
     return img[0]
+
 
 def build_scheduler(optimizer, warmup_epochs, total_epochs):
     if optimizer is None:
@@ -177,14 +184,41 @@ def setup(
     is_3d_model = "3D" in args.model
 
     if is_3d_model:
-        net = models_params[args.model]["net"](in_dim=1, out_dim=K, **models_params[args.model]["args"])
+        net = models_params[args.model]["net"](
+            in_dim=1, out_dim=K, **models_params[args.model]["args"]
+        )
         z_window = 1
     else:
         z_window = models_params[args.model]["args"].get("z_window", 1)
-        net = models_params[args.model]["net"](z_window, K, **models_params[args.model]["args"])
+        net = models_params[args.model]["net"](
+            z_window, K, **models_params[args.model]["args"]
+        )
 
     net.init_weights()
     net.to(device)
+
+    B: int = (
+        args.batch_size
+        if hasattr(args, "batch_size")
+        else datasets_params[args.dataset]["B"]
+    )
+
+    if is_3d_model:
+        # Shape: (Batch, Channels, Depth/Slices, Height, Width)
+        summary_input_size = (B, 1, 128, 256, 256)
+    else:
+        if z_window > 1:
+            # Multi-slice 2D models expecting [B, Z, C, H, W]
+            summary_input_size = (B, z_window, 1, 256, 256)
+        else:
+            # Standard 2D models expecting [B, C, H, W]
+            summary_input_size = (B, 1, 256, 256)
+
+    print("=== MODEL SUMMARY ===")
+    try:
+        summary(net, input_size=summary_input_size, device=device.type)
+    except Exception as e:
+        print(f">> Model summary failed with input shape {summary_input_size}: {e}")
 
     if getattr(args, "compile", False):
         if hasattr(torch, "compile"):
@@ -233,7 +267,6 @@ def setup(
 
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
 
-    B: int = args.batch_size if hasattr(args, "batch_size") else datasets_params[args.dataset]["B"]
     root_dir = Path("data") / args.dataset
 
     DatasetClass = Segthor3DDataset if is_3d_model else SliceDataset
@@ -394,15 +427,28 @@ def runTraining(args):
 
                     if m == "val":
                         if is_3d_model:
-                            predicted_class: Tensor = probs2class(pred_probs)  # Shape: [B, Z, H, W]
+                            predicted_class: Tensor = probs2class(
+                                pred_probs
+                            )  # Shape: [B, Z, H, W]
                             for b in range(B):
                                 vol = predicted_class[b].cpu().numpy().astype(np.uint8)
-                                vol = np.transpose(vol, (1, 2, 0))  # Convert [Z, H, W] to [H, W, Z]
-                                
+                                vol = np.transpose(
+                                    vol, (1, 2, 0)
+                                )  # Convert [Z, H, W] to [H, W, Z]
+
                                 patient_affine = data["affine"][b].cpu().numpy()
-                                patient_orig_shape = data["orig_shape"][b].cpu().numpy()  # [H, W, Z]
-                                
-                                val_3d_predictions.append((vol, data["stems"][b], patient_affine, patient_orig_shape))
+                                patient_orig_shape = (
+                                    data["orig_shape"][b].cpu().numpy()
+                                )  # [H, W, Z]
+
+                                val_3d_predictions.append(
+                                    (
+                                        vol,
+                                        data["stems"][b],
+                                        patient_affine,
+                                        patient_orig_shape,
+                                    )
+                                )
                         else:
                             with warnings.catch_warnings():
                                 warnings.filterwarnings("ignore", category=UserWarning)
@@ -472,7 +518,7 @@ def runTraining(args):
             if is_3d_model:
                 best_folder.mkdir(parents=True, exist_ok=True)
                 for vol_3d, stem, patient_affine, orig_shape in val_3d_predictions:
-                    
+
                     # Rescale prediction back to the patient's native dimensions
                     resized_vol = resize(
                         vol_3d.astype(float),
@@ -480,9 +526,9 @@ def runTraining(args):
                         order=0,  # Nearest neighbor is mandatory for segmentation masks
                         mode="constant",
                         preserve_range=True,
-                        anti_aliasing=False
+                        anti_aliasing=False,
                     ).astype(np.uint8)
-                    
+
                     # Save using the true patient affine and native shape
                     nifti_img = nib.Nifti1Image(resized_vol, affine=patient_affine)
                     nib.save(nifti_img, best_folder / f"{stem}.nii.gz")
