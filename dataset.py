@@ -114,6 +114,7 @@ class SliceDataset(Dataset):
         debug=False,
         z_window=1,
         drop_empty=False,
+        resample=False
     ):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
@@ -135,6 +136,8 @@ class SliceDataset(Dataset):
             for idx, (_, gt_path) in enumerate(self.full_files):
                 if gt_path is not None:
                     gt_arr = np.array(Image.open(gt_path))
+                    # Check if slice contains any foreground target organ (labels 1, 2, 3, 4)
+                    # Works for both raw classes [1, 2, 3, 4] and scaled values [63, 126, 189, 252]
                     has_target_organs = np.any((gt_arr > 0) & (gt_arr <= 252))
                     if has_target_organs:
                         self.valid_indices.append(idx)
@@ -164,6 +167,7 @@ class SliceDataset(Dataset):
         )
 
     def _get_valid_index(self, center_full_idx: int, offset: int) -> int:
+        """Prevents indexing out of bounds against the complete file list"""
         target_idx = center_full_idx + offset
 
         if target_idx < 0 or target_idx >= len(self.full_files):
@@ -184,24 +188,32 @@ class SliceDataset(Dataset):
         return len(self.valid_indices)
 
     def __getitem__(self, index) -> dict:
-        img_tensors = []
+        center_full_idx = self.valid_indices[index]
 
+        img_tensors = []
         for offset in range(-self.half_z, self.half_z + 1):
-            valid_idx = self._get_valid_index(index, offset)
-            img_path, _ = self.files[valid_idx]
-            img_tensors.append(self.img_transform(np.load(img_path)))
+            valid_idx = self._get_valid_index(center_full_idx, offset)
+            img_path, _ = self.full_files[valid_idx]
+            img_data = np.load(img_path)
+            if self.img_transform is not None:
+                img_data = self.img_transform(img_data)
+            img_tensors.append(img_data)
 
         if self.z_window == 1:
             stacked_img = img_tensors[0]
         else:
             stacked_img = torch.stack(img_tensors, dim=0)
 
-        center_stem = self.files[index][0].stem
+        center_stem = self.full_files[center_full_idx][0].stem
         data_dict = {"images": stacked_img, "stems": center_stem}
 
         if not self.test_mode:
-            _, gt_path = self.files[index]
-            gt = self.gt_transform(np.load(gt_path))
+            _, gt_path = self.full_files[center_full_idx]
+            gt_data = np.load(gt_path)
+            if self.gt_transform is not None:
+                gt_data = self.gt_transform(gt_data)
+
+            gt = gt_data
 
             if self.spatial_transform is not None:
                 if self.z_window > 1:
