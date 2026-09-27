@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.10
+#!/usr/bin/env python3
 
 import torch
 import torch.nn as nn
@@ -6,9 +6,17 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def random_weights_init_3d(m):
+def get_group_norm_3d(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    """Helper to dynamically choose a valid number of groups for GroupNorm (3D)."""
+    for g in [32, 16, 8, 4, 2]:
+        if g <= max_groups and num_channels % g == 0:
+            return nn.GroupNorm(g, num_channels)
+    return nn.GroupNorm(1, num_channels)
+
+
+def random_weights_init_3d(m: nn.Module) -> None:
     if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d)):
-        nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="leaky_relu")
+        nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
             nn.init.zeros_(m.bias)
     elif isinstance(m, (nn.GroupNorm, nn.BatchNorm3d)):
@@ -16,12 +24,29 @@ def random_weights_init_3d(m):
         nn.init.zeros_(m.bias)
 
 
-class SqueezeExcite3D(nn.Module):
-    """3D Channel attention to highlight small volumetric structures."""
+class DropPath3D(nn.Module):
+    """Stochastic Depth (DropPath) per sample for 3D residual structures."""
 
-    def __init__(self, channels: int, reduction: int = 4):
+    def __init__(self, drop_prob: float = 0.0):
         super().__init__()
-        reduced = max(8, channels // reduction)
+        self.drop_prob = drop_prob
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        return x.div(keep_prob) * random_tensor
+
+
+class SqueezeExcite3D(nn.Module):
+    """3D Channel attention optimized for single-channel/sparse volumetric inputs."""
+
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        reduced = max(4, channels // reduction)
         self.fc = nn.Sequential(
             nn.AdaptiveAvgPool3d(1),
             nn.Conv3d(channels, reduced, kernel_size=1),
@@ -35,51 +60,70 @@ class SqueezeExcite3D(nn.Module):
 
 
 class DepthwiseSeparableBlock3D(nn.Module):
-    """Stable 3D block utilizing GroupNorm for small 3D batch sizes."""
+    """Enhanced 3D Depthwise Separable Block using DropPath instead of aggressive Dropout3d."""
 
-    def __init__(self, in_dim: int, out_dim: int, stride: int = 1):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        stride: int | tuple[int, int, int] = 1,
+        kernel_size: int | tuple[int, int, int] = 3,
+        dilation: int | tuple[int, int, int] = 1,
+        drop_rate: float = 0.0,
+    ):
         super().__init__()
-        groups_in = 8 if in_dim % 8 == 0 else 1
-        groups_out = 8 if out_dim % 8 == 0 else 1
+
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation, dilation)
+
+        padding = tuple((k - 1) // 2 * d for k, d in zip(kernel_size, dilation))
 
         self.conv = nn.Sequential(
-            # 3D Depthwise
+            # Depthwise 3D
             nn.Conv3d(
                 in_dim,
                 in_dim,
-                kernel_size=3,
+                kernel_size=kernel_size,
                 stride=stride,
-                padding=1,
+                padding=padding,
+                dilation=dilation,
                 groups=in_dim,
                 bias=False,
             ),
-            nn.GroupNorm(groups_in, in_dim),
+            get_group_norm_3d(in_dim),
             nn.SiLU(inplace=True),
-            # 3D Pointwise
+            # Pointwise 3D
             nn.Conv3d(in_dim, out_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(groups_out, out_dim),
+            get_group_norm_3d(out_dim),
             nn.SiLU(inplace=True),
         )
         self.se = SqueezeExcite3D(out_dim)
+        self.drop_path = DropPath3D(drop_rate) if drop_rate > 0.0 else nn.Identity()
 
-        if stride != 1 or in_dim != out_dim:
+        if stride != 1 or stride != (1, 1, 1) or in_dim != out_dim:
             self.shortcut = nn.Sequential(
                 nn.Conv3d(in_dim, out_dim, kernel_size=1, stride=stride, bias=False),
-                nn.GroupNorm(groups_out, out_dim),
+                get_group_norm_3d(out_dim),
             )
         else:
             self.shortcut = nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.se(self.conv(x)) + self.shortcut(x)
+        return self.shortcut(x) + self.drop_path(self.se(self.conv(x)))
 
 
 class UpDecoderBlock3D(nn.Module):
-    """3D UpDecoder Block using Trilinear Interpolation."""
+    """3D Decoder Block using trilinear upsampling with residual shortcut."""
 
-    def __init__(self, in_dim: int, skip_dim: int, out_dim: int):
+    def __init__(
+        self, in_dim: int, skip_dim: int, out_dim: int, drop_rate: float = 0.0
+    ):
         super().__init__()
-        self.conv = DepthwiseSeparableBlock3D(in_dim + skip_dim, out_dim)
+        self.conv = DepthwiseSeparableBlock3D(
+            in_dim + skip_dim, out_dim, drop_rate=drop_rate
+        )
 
     def forward(self, x: Tensor, skip: Tensor) -> Tensor:
         x_up = F.interpolate(
@@ -90,44 +134,51 @@ class UpDecoderBlock3D(nn.Module):
 
 
 class ImprovedENet3D(nn.Module):
-    """Full 3D ImprovedENet Architecture for volumetric segmentation [B, C, Z, H, W]."""
-
-    def __init__(self, in_dim: int, out_dim: int, **kwargs):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        drop_rate: float = 0.1,
+        bottleneck_drop_rate: float = 0.2,
+        **kwargs
+    ):
         super().__init__()
         factor: int = kwargs.get("factor", 2)
         K: int = max(16, kwargs.get("kernels", 16) * factor)
 
-        # Stem
+        # Stem: Handles single-channel input without aggressive channel dropout
         self.stem = nn.Sequential(
-            nn.Conv3d(in_dim, K, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8 if K % 8 == 0 else 1, K),
+            nn.Conv3d(in_dim, K, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+            get_group_norm_3d(K),
             nn.SiLU(inplace=True),
-            DepthwiseSeparableBlock3D(K, K),
+            DepthwiseSeparableBlock3D(K, K, drop_rate=0.0),
         )
 
-        # Encoder
-        self.enc1 = DepthwiseSeparableBlock3D(K, K * 2, stride=2)
-        self.enc2 = DepthwiseSeparableBlock3D(K * 2, K * 4, stride=2)
-        self.enc3 = DepthwiseSeparableBlock3D(K * 4, K * 8, stride=2)
+        # Encoders with anisotropic Z-handling for medical scans
+        self.enc1 = DepthwiseSeparableBlock3D(K, K * 2, stride=(1, 2, 2), drop_rate=drop_rate)
+        self.enc2 = DepthwiseSeparableBlock3D(K * 2, K * 4, stride=2, drop_rate=drop_rate)
+        self.enc3 = DepthwiseSeparableBlock3D(K * 4, K * 8, stride=2, drop_rate=drop_rate)
 
-        # Bottleneck
+        # Bottleneck: Multi-scale 3D Dilations to collect context without spatial collapse
         self.bottleneck = nn.Sequential(
-            DepthwiseSeparableBlock3D(K * 8, K * 8),
-            DepthwiseSeparableBlock3D(K * 8, K * 8),
-            DepthwiseSeparableBlock3D(K * 8, K * 8),
+            DepthwiseSeparableBlock3D(K * 8, K * 8, dilation=(1, 1, 1), drop_rate=bottleneck_drop_rate),
+            DepthwiseSeparableBlock3D(K * 8, K * 8, dilation=(1, 2, 2), drop_rate=bottleneck_drop_rate),
+            DepthwiseSeparableBlock3D(K * 8, K * 8, dilation=(2, 4, 4), drop_rate=bottleneck_drop_rate),
         )
 
-        # Decoder
-        self.dec3 = UpDecoderBlock3D(in_dim=K * 8, skip_dim=K * 4, out_dim=K * 4)
-        self.dec2 = UpDecoderBlock3D(in_dim=K * 4, skip_dim=K * 2, out_dim=K * 2)
-        self.dec1 = UpDecoderBlock3D(in_dim=K * 2, skip_dim=K, out_dim=K)
+        # Decoders
+        self.dec3 = UpDecoderBlock3D(
+            in_dim=K * 8, skip_dim=K * 4, out_dim=K * 4, drop_rate=drop_rate
+        )
+        self.dec2 = UpDecoderBlock3D(
+            in_dim=K * 4, skip_dim=K * 2, out_dim=K * 2, drop_rate=drop_rate
+        )
+        self.dec1 = UpDecoderBlock3D(
+            in_dim=K * 2, skip_dim=K, out_dim=K, drop_rate=drop_rate
+        )
 
         # Final Classifier
         self.final = nn.Conv3d(K, out_dim, kernel_size=1)
-
-        print(
-            f"> Initialized {self.__class__.__name__} ({in_dim=}->{out_dim=}) with {kwargs}"
-        )
 
     def forward(self, input: Tensor) -> Tensor:
         x0 = self.stem(input)
