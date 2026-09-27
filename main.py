@@ -32,6 +32,7 @@ from shutil import copytree, rmtree
 import torch
 import numpy as np
 import nibabel as nib
+import SimpleITK as sitk
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
@@ -204,14 +205,11 @@ def setup(
     )
 
     if is_3d_model:
-        # Shape: (Batch, Channels, Depth/Slices, Height, Width)
         summary_input_size = (B, 1, 128, 256, 256)
     else:
         if z_window > 1:
-            # Multi-slice 2D models expecting [B, Z, C, H, W]
             summary_input_size = (B, z_window, 1, 256, 256)
         else:
-            # Standard 2D models expecting [B, C, H, W]
             summary_input_size = (B, 1, 256, 256)
 
     print("=== MODEL SUMMARY ===")
@@ -271,16 +269,24 @@ def setup(
 
     DatasetClass = Segthor3DDataset if is_3d_model else SliceDataset
 
+    dataset_kwargs = {
+        "img_transform": img_transform,
+        "gt_transform": partial(gt_transform, K),
+        "debug": args.debug,
+        "z_window": z_window,
+        "resample": args.resample,
+    }
+    
+    # Pass target_spacing if supported by the dataset class (e.g., Segthor3DDataset)
+    if is_3d_model:
+        dataset_kwargs["target_spacing"] = tuple(args.target_spacing)
+
     train_set = DatasetClass(
         "train",
         root_dir,
-        img_transform=img_transform,
-        gt_transform=partial(gt_transform, K),
         augment=args.augment,
         drop_empty=args.drop_empty,
-        debug=args.debug,
-        z_window=z_window,
-        resample=args.resample
+        **dataset_kwargs,
     )
     train_loader = DataLoader(
         train_set,
@@ -297,11 +303,7 @@ def setup(
     val_set = DatasetClass(
         "val",
         root_dir,
-        img_transform=img_transform,
-        gt_transform=partial(gt_transform, K),
-        debug=args.debug,
-        z_window=z_window,
-        resample=args.resample
+        **dataset_kwargs,
     )
     val_loader = DataLoader(
         val_set,
@@ -358,7 +360,7 @@ def runTraining(args):
     best_dice: float = 0
 
     for e in range(args.epochs):
-        val_3d_predictions = []  # Store 3D volumes in memory if is_3d_model is True
+        val_3d_predictions = []
 
         for m in ["train", "val"]:
             match m:
@@ -429,28 +431,49 @@ def runTraining(args):
 
                     if m == "val":
                         if is_3d_model:
-                            predicted_class: Tensor = probs2class(
-                                pred_probs
-                            )  # Shape: [B, Z, H, W]
+                            predicted_class: Tensor = probs2class(pred_probs)
                             for b in range(B):
                                 vol = predicted_class[b].cpu().numpy().astype(np.uint8)
-                                vol = np.transpose(
-                                    vol, (1, 2, 0)
-                                )  # Convert [Z, H, W] to [H, W, Z]
+                                vol = np.transpose(vol, (1, 2, 0))
 
                                 patient_affine = data["affine"][b].cpu().numpy()
-                                patient_orig_shape = (
-                                    data["orig_shape"][b].cpu().numpy()
-                                )  # [H, W, Z]
+                                patient_orig_shape = data["orig_shape"][b].cpu().numpy()
+                                patient_stem = data["stems"][b]
 
-                                val_3d_predictions.append(
-                                    (
-                                        vol,
-                                        data["stems"][b],
-                                        patient_affine,
-                                        patient_orig_shape,
-                                    )
-                                )
+                                if args.resample:
+                                    raw_folder = "test" if val_loader.dataset.test_mode else "train"
+                                    patient_dir = Path("data") / args.dataset / raw_folder / patient_stem
+                                    orig_img_path = patient_dir / f"{patient_stem}.nii.gz"
+                                    
+                                    orig_sitk = sitk.ReadImage(str(orig_img_path))
+                                    
+                                    pred_sitk = sitk.GetImageFromArray(np.transpose(vol, (2, 0, 1)))
+                                    pred_sitk.SetSpacing(tuple(args.target_spacing))
+                                    
+                                    resample_filter = sitk.ResampleImageFilter()
+                                    resample_filter.SetReferenceImage(orig_sitk)
+                                    resample_filter.SetInterpolator(sitk.sitkNearestNeighbor)
+                                    resample_filter.SetDefaultPixelValue(0)
+                                    
+                                    resampled_sitk = resample_filter.Execute(pred_sitk)
+                                    resized_vol = sitk.GetArrayFromImage(resampled_sitk)
+                                    resized_vol = np.transpose(resized_vol, (1, 2, 0))
+                                    
+                                    orig_nii = nib.load(str(orig_img_path))
+                                    nifti_img = nib.Nifti1Image(resized_vol.astype(np.uint8), affine=orig_nii.affine)
+                                    val_3d_predictions.append((nifti_img, patient_stem))
+                                else:
+                                    resized_vol = resize(
+                                        vol.astype(float),
+                                        tuple(patient_orig_shape),
+                                        order=0,
+                                        mode="constant",
+                                        preserve_range=True,
+                                        anti_aliasing=False,
+                                    ).astype(np.uint8)
+
+                                    nifti_img = nib.Nifti1Image(resized_vol, affine=patient_affine)
+                                    val_3d_predictions.append((nifti_img, patient_stem))
                         else:
                             with warnings.catch_warnings():
                                 warnings.filterwarnings("ignore", category=UserWarning)
@@ -519,20 +542,7 @@ def runTraining(args):
 
             if is_3d_model:
                 best_folder.mkdir(parents=True, exist_ok=True)
-                for vol_3d, stem, patient_affine, orig_shape in val_3d_predictions:
-
-                    # Rescale prediction back to the patient's native dimensions
-                    resized_vol = resize(
-                        vol_3d.astype(float),
-                        tuple(orig_shape),
-                        order=0,  # Nearest neighbor is mandatory for segmentation masks
-                        mode="constant",
-                        preserve_range=True,
-                        anti_aliasing=False,
-                    ).astype(np.uint8)
-
-                    # Save using the true patient affine and native shape
-                    nifti_img = nib.Nifti1Image(resized_vol, affine=patient_affine)
+                for nifti_img, stem in val_3d_predictions:
                     nib.save(nifti_img, best_folder / f"{stem}.nii.gz")
             else:
                 copytree(args.dest / f"iter{e:03d}", Path(best_folder))
@@ -622,10 +632,16 @@ def main():
         action="store_true",
     )
     parser.add_argument(
-            "--resample",
-            action="store_true",
-        )
-    
+        "--resample",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--target_spacing",
+        nargs=3,
+        default=[1.0, 1.0, 1.0],
+        type=float,
+        help="Target spacing for resampling volumes (3 floats, e.g. 1.0 1.0 1.0).",
+    )
 
     args = parser.parse_args()
 
