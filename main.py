@@ -49,6 +49,7 @@ from torchinfo import summary
 from dataset import SliceDataset, Segthor3DDataset
 from ShallowNet import shallowCNN
 from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
+from MambaNet import MambaNet
 from ImprovedENet import ImprovedENet
 from ImprovedENet3D import ImprovedENet3D
 from ENet3D import ENet3D, AttentionENet3D
@@ -93,7 +94,11 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 8, "factor": 2, "z_window": 15},
+    "args": {"kernels": 16, "factor": 2, "z_window": 15},
+}
+models_params["MambaNet"] = {
+    "net": MambaNet,
+    "args": {"kernels": 16, "factor": 2, "z_window": 15},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,
