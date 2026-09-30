@@ -98,7 +98,7 @@ models_params["ImprovedENet"] = {
 }
 models_params["MambaNet"] = {
     "net": MambaNet,
-    "args": {"kernels": 16, "factor": 2, "z_window": 15},
+    "args": {"kernels": 32, "factor": 2, "z_window": 15},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,

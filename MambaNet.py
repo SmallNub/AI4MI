@@ -4,15 +4,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from typing import Tuple, Union
 
 try:
     from mamba_ssm import Mamba3 as Mamba
 except ImportError:
     Mamba = None
 
+# =====================================================================
+# Utilities & Normalization
+# =====================================================================
+
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching the working ImprovedENet setup."""
+    """Dynamic GroupNorm matching channel divisibility."""
     for g in [32, 16, 8, 4, 2]:
         if g <= max_groups and num_channels % g == 0:
             return nn.GroupNorm(g, num_channels)
@@ -39,7 +44,8 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
-def random_weights_init(m: nn.Module) -> None:
+def model_weights_init(m: nn.Module) -> None:
+    """Weight initialization for ConvNeXt & SSM modules."""
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -49,8 +55,13 @@ def random_weights_init(m: nn.Module) -> None:
         nn.init.zeros_(m.bias)
 
 
+# =====================================================================
+# ConvNeXt & Attention Modules
+# =====================================================================
+
+
 class SqueezeExcite(nn.Module):
-    """Channel attention module."""
+    """Channel attention with dynamic reduction."""
 
     def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
@@ -67,8 +78,8 @@ class SqueezeExcite(nn.Module):
         return x * self.fc(x)
 
 
-class DepthwiseSeparableBlock(nn.Module):
-    """ConvNeXt-style 7x7 Depthwise Separable Block with SqueezeExcite."""
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Inverted Bottleneck Block with LayerScale."""
 
     def __init__(
         self,
@@ -76,28 +87,37 @@ class DepthwiseSeparableBlock(nn.Module):
         out_dim: int,
         kernel_size: int = 7,
         stride: int = 1,
+        expand_ratio: int = 4,
         drop_path_rate: float = 0.0,
+        layer_scale_init: float = 1e-6,
     ):
         super().__init__()
         padding = kernel_size // 2
+        hidden_dim = in_dim * expand_ratio
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(
-                in_dim,
-                in_dim,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=in_dim,
-                bias=False,
-            ),
-            get_group_norm(in_dim),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False),
-            get_group_norm(out_dim),
-            nn.SiLU(inplace=True),
+        self.dwconv = nn.Conv2d(
+            in_dim,
+            in_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_dim,
+            bias=False,
         )
+        self.norm = get_group_norm(in_dim)
+        self.pwconv1 = nn.Conv2d(in_dim, hidden_dim, kernel_size=1, bias=False)
+        self.act = nn.SiLU(inplace=True)
+        self.pwconv2 = nn.Conv2d(hidden_dim, out_dim, kernel_size=1, bias=False)
         self.se = SqueezeExcite(out_dim)
+
+        self.gamma = (
+            nn.Parameter(
+                layer_scale_init * torch.ones(out_dim, 1, 1), requires_grad=True
+            )
+            if layer_scale_init > 0
+            else None
+        )
+
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
@@ -111,18 +131,54 @@ class DepthwiseSeparableBlock(nn.Module):
             self.shortcut = nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.shortcut(x) + self.drop_path(self.se(self.conv(x)))
+        input_tensor = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.se(x)
+
+        if self.gamma is not None:
+            x = x * self.gamma
+
+        return self.shortcut(input_tensor) + self.drop_path(x)
+
+
+class SpatialAttentionGate(nn.Module):
+    """Attention Gate for skip feature filtering before decoder fusion."""
+
+    def __init__(self, gate_dim: int, skip_dim: int, inter_dim: int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_dim, inter_dim, kernel_size=1, bias=False),
+            get_group_norm(inter_dim),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_dim, inter_dim, kernel_size=1, bias=False),
+            get_group_norm(inter_dim),
+        )
+        self.psi = nn.Sequential(
+            nn.SiLU(inplace=True),
+            nn.Conv2d(inter_dim, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, g: Tensor, x: Tensor) -> Tensor:
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        alpha = self.psi(g1 + x1)
+        return x * alpha
 
 
 class LiteDepthwiseASPPModule(nn.Module):
-    """Lite Atrous Spatial Pyramid Pooling for lightweight multi-scale context."""
+    """Lite Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
         mid_dim = max(16, in_dim // 4)
         self.branches = nn.ModuleList()
 
-        # 1x1 Conv Branch
         self.branches.append(
             nn.Sequential(
                 nn.Conv2d(in_dim, mid_dim, kernel_size=1, bias=False),
@@ -131,7 +187,6 @@ class LiteDepthwiseASPPModule(nn.Module):
             )
         )
 
-        # Dilated Depthwise Separable Branches
         for rate in rates[1:]:
             self.branches.append(
                 nn.Sequential(
@@ -150,7 +205,6 @@ class LiteDepthwiseASPPModule(nn.Module):
                 )
             )
 
-        # Global Pooling Branch
         self.glob_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_dim, mid_dim, kernel_size=1, bias=False),
@@ -177,8 +231,17 @@ class LiteDepthwiseASPPModule(nn.Module):
         return self.project(torch.cat(res, dim=1))
 
 
+# =====================================================================
+# Optimized 2D Cross-Scan Mamba Module
+# =====================================================================
+
+
 class Mamba2DBlock(nn.Module):
-    """Bidirectional Spatial SSM block with DropPath regularization."""
+    """Batched 4-Directional 2D Spatial Cross-Scanning SSM Block.
+
+    Executes all 4 spatial scanning directions in a SINGLE batched SSM kernel
+    pass [4*B, L, C] to maximize GPU occupancy and eliminate launch overhead.
+    """
 
     def __init__(
         self,
@@ -189,10 +252,8 @@ class Mamba2DBlock(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
+        self.dim = dim
         self.norm = nn.LayerNorm(dim)
-
-        if Mamba is None:
-            raise ImportError("mamba_ssm package is not installed.")
 
         d_inner = dim * expand
         if d_inner % headdim != 0:
@@ -205,27 +266,61 @@ class Mamba2DBlock(nn.Module):
             headdim=headdim,
             is_mimo=False,
         )
-        self.proj = nn.Linear(dim, dim)
+
+        self.proj = nn.Linear(dim * 4, dim)
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
 
+    @torch.compiler.disable()
+    def mamba_call(self, x: Tensor) -> Tensor:
+        return self.mamba(x)
+
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
-        x_flat = x.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        x_norm = self.norm(x_flat)
+        L = H * W
 
-        # Bidirectional scan reuse
-        out_fw = self.mamba(x_norm)
-        out_bw = torch.flip(self.mamba(torch.flip(x_norm, dims=[1])), dims=[1])
+        # Permute to (B, H, W, C) & Normalize
+        x_norm = self.norm(x.permute(0, 2, 3, 1).contiguous())
 
-        mamba_out = self.proj(out_fw + out_bw)
-        out = x_flat + self.drop_path(mamba_out)
-        return out.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        # Construct 4 directional scan sequences
+        # 1. Horizontal Forward
+        x1 = x_norm.view(B, L, C)
+        # 2. Horizontal Backward
+        x2 = torch.flip(x1, dims=[1])
+        # 3. Vertical Forward
+        x3 = x_norm.permute(0, 2, 1, 3).contiguous().view(B, L, C)
+        # 4. Vertical Backward
+        x4 = torch.flip(x3, dims=[1])
+
+        # Batch all 4 directions together [4*B, L, C] for a single kernel pass
+        xs = torch.cat([x1, x2, x3, x4], dim=0)
+
+        ys = self.mamba_call(xs)
+
+        # Split outputs back to 4 streams
+        y1, y2, y3, y4 = torch.chunk(ys, 4, dim=0)
+
+        # Unflip and re-arrange back to 2D image spatial structure
+        y1 = y1.view(B, H, W, C)
+        y2 = torch.flip(y2, dims=[1]).view(B, H, W, C)
+        y3 = y3.view(B, W, H, C).permute(0, 2, 1, 3)
+        y4 = torch.flip(y4, dims=[1]).view(B, W, H, C).permute(0, 2, 1, 3)
+
+        # Concatenate 4 scan features and project back to original channel dim
+        merged = torch.cat([y1, y2, y3, y4], dim=-1)
+        mamba_out = self.proj(merged).permute(0, 3, 1, 2)
+
+        return x + self.drop_path(mamba_out)
+
+
+# =====================================================================
+# Decoder Block
+# =====================================================================
 
 
 class UpDecoderBlock(nn.Module):
-    """Refined Decoder Block with Skip Fusion and optional Mamba scanning."""
+    """Attention-Gated Decoder Block with Skip Fusion."""
 
     def __init__(
         self,
@@ -236,6 +331,10 @@ class UpDecoderBlock(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
+        self.attn_gate = SpatialAttentionGate(
+            gate_dim=in_dim, skip_dim=skip_dim, inter_dim=out_dim // 2
+        )
+
         concat_dim = in_dim + skip_dim
         self.reduce = nn.Sequential(
             nn.Conv2d(concat_dim, out_dim, kernel_size=1, bias=False),
@@ -246,7 +345,7 @@ class UpDecoderBlock(nn.Module):
         if use_mamba:
             self.spatial = Mamba2DBlock(dim=out_dim, drop_path_rate=drop_path_rate)
         else:
-            self.spatial = DepthwiseSeparableBlock(
+            self.spatial = ConvNeXtBlock(
                 out_dim, out_dim, kernel_size=7, drop_path_rate=drop_path_rate
             )
 
@@ -254,12 +353,18 @@ class UpDecoderBlock(nn.Module):
         x_up = F.interpolate(
             x, size=skip.shape[2:], mode="bilinear", align_corners=False
         )
-        reduced = self.reduce(torch.cat([x_up, skip], dim=1))
+        skip_gated = self.attn_gate(g=x_up, x=skip)
+        reduced = self.reduce(torch.cat([x_up, skip_gated], dim=1))
         return self.spatial(reduced)
 
 
+# =====================================================================
+# Main Architecture: MambaNet
+# =====================================================================
+
+
 class MambaNet(nn.Module):
-    """Upgraded Hybrid Mamba-ConvNeXt Architecture (~350k parameters)."""
+    """Hybrid Mamba-ConvNeXt Architecture with Batched 2D Cross-Scan."""
 
     def __init__(
         self,
@@ -267,42 +372,39 @@ class MambaNet(nn.Module):
         out_dim: int = 1,
         drop_rate: float = 0.1,
         bottleneck_drop_rate: float = 0.2,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
-        K: int = kwargs.get("kernels", 16)  # Base channels (16 -> 32 -> 64 -> 128)
+        K: int = kwargs.get("kernels", 16)
 
-        # Stem (256x256)
+        # Stem Layer
         self.stem = nn.Sequential(
             nn.Conv2d(in_dim, K, kernel_size=3, padding=1, bias=False),
             get_group_norm(K),
             nn.SiLU(inplace=True),
-            DepthwiseSeparableBlock(K, K, kernel_size=3, drop_path_rate=0.0),
+            ConvNeXtBlock(K, K, kernel_size=3, drop_path_rate=0.0),
         )
 
         # Encoder Path
-        # Stage 1: 256x256 -> 128x128
-        self.enc1 = DepthwiseSeparableBlock(
+        self.enc1 = ConvNeXtBlock(
             K, K * 2, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.2
         )
 
-        # Stage 2: 128x128 -> 64x64 (Mamba-enabled)
         self.enc2 = nn.Sequential(
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 2, K * 4, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.4
             ),
             Mamba2DBlock(dim=K * 4, drop_path_rate=drop_rate * 0.4),
         )
 
-        # Stage 3: 64x64 -> 32x32 (Mamba-enabled)
         self.enc3 = nn.Sequential(
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 4, K * 8, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.6
             ),
             Mamba2DBlock(dim=K * 8, drop_path_rate=drop_rate * 0.6),
         )
 
-        # Bottleneck (32x32): Lite-ASPP + Mamba
+        # Bottleneck: Lite-ASPP + 2D Mamba
         self.bottleneck = nn.Sequential(
             LiteDepthwiseASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
             Mamba2DBlock(dim=K * 8, drop_path_rate=bottleneck_drop_rate),
@@ -334,9 +436,9 @@ class MambaNet(nn.Module):
         # Final Classifier
         self.final = nn.Conv2d(K, out_dim, kernel_size=1)
 
-        self.apply(random_weights_init)
+        self.apply(model_weights_init)
 
-    def forward(self, input: Tensor) -> Tensor:
+    def forward(self, input: Tensor) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         if input.dim() == 5:
             B, Z, C, H, W = input.shape
             input = input.view(B, Z * C, H, W)
@@ -352,7 +454,8 @@ class MambaNet(nn.Module):
         d2 = self.dec2(d3, x1)
         d1 = self.dec1(d2, x0)
 
-        return self.final(d1)
+        out = self.final(d1)
+        return out
 
-    def init_weights(self, *args, **kwargs):
-        self.apply(random_weights_init)
+    def init_weights(self):
+        self.apply(model_weights_init)
