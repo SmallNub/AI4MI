@@ -50,6 +50,7 @@ from dataset import SliceDataset, Segthor3DDataset
 from ShallowNet import shallowCNN
 from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
 from MambaNet import MambaNet
+from MambaNet3D import MambaNet3D
 from ImprovedENet import ImprovedENet
 from ImprovedENet3D import ImprovedENet3D
 from ENet3D import ENet3D, AttentionENet3D
@@ -99,6 +100,10 @@ models_params["ImprovedENet"] = {
 models_params["MambaNet"] = {
     "net": MambaNet,
     "args": {"kernels": 32, "factor": 2, "z_window": 15},
+}
+models_params["MambaNet3D"] = {
+    "net": MambaNet3D,
+    "args": {"kernels": 2, "factor": 2},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,
@@ -201,7 +206,7 @@ def setup(
         )
 
     net.init_weights()
-    net.to(device)
+    net = net.to(device=device)
 
     B: int = (
         args.batch_size
@@ -243,8 +248,14 @@ def setup(
         "device": device,
     }
 
+    # Fused Optimizer support
+    optim_kwargs = dict(optimizer_params[args.optim]["args"])
+    if gpu and args.optim == "adam" and getattr(args, "fused", True):
+        optim_kwargs["fused"] = True
+        print(">> Using fused Adam optimizer")
+
     optimizer_net = optimizer_params[args.optim]["optim"](
-        net.parameters(), lr=args.lr, **optimizer_params[args.optim]["args"]
+        net.parameters(), lr=args.lr, **optim_kwargs
     )
 
     optimizer_loss = None
@@ -263,7 +274,7 @@ def setup(
                 loss_params,
                 lr=1e-3,
                 weight_decay=0.0,
-                **optimizer_params[args.optim]["args"],
+                **optim_kwargs,
             )
 
     warmup_epochs = getattr(args, "warmup_epochs", 5)
@@ -281,8 +292,7 @@ def setup(
         "z_window": z_window,
         "resample": args.resample,
     }
-    
-    # Pass target_spacing if supported by the dataset class (e.g., Segthor3DDataset)
+
     if is_3d_model:
         dataset_kwargs["target_spacing"] = tuple(args.target_spacing)
 
@@ -446,26 +456,44 @@ def runTraining(args):
                                 patient_stem = data["stems"][b]
 
                                 if args.resample:
-                                    raw_folder = "test" if val_loader.dataset.test_mode else "train"
-                                    patient_dir = Path("data") / args.dataset / raw_folder / patient_stem
-                                    orig_img_path = patient_dir / f"{patient_stem}.nii.gz"
-                                    
+                                    raw_folder = (
+                                        "test"
+                                        if val_loader.dataset.test_mode
+                                        else "train"
+                                    )
+                                    patient_dir = (
+                                        Path("data")
+                                        / args.dataset
+                                        / raw_folder
+                                        / patient_stem
+                                    )
+                                    orig_img_path = (
+                                        patient_dir / f"{patient_stem}.nii.gz"
+                                    )
+
                                     orig_sitk = sitk.ReadImage(str(orig_img_path))
-                                    
-                                    pred_sitk = sitk.GetImageFromArray(np.transpose(vol, (2, 0, 1)))
+
+                                    pred_sitk = sitk.GetImageFromArray(
+                                        np.transpose(vol, (2, 0, 1))
+                                    )
                                     pred_sitk.SetSpacing(tuple(args.target_spacing))
-                                    
+
                                     resample_filter = sitk.ResampleImageFilter()
                                     resample_filter.SetReferenceImage(orig_sitk)
-                                    resample_filter.SetInterpolator(sitk.sitkNearestNeighbor)
+                                    resample_filter.SetInterpolator(
+                                        sitk.sitkNearestNeighbor
+                                    )
                                     resample_filter.SetDefaultPixelValue(0)
-                                    
+
                                     resampled_sitk = resample_filter.Execute(pred_sitk)
                                     resized_vol = sitk.GetArrayFromImage(resampled_sitk)
                                     resized_vol = np.transpose(resized_vol, (1, 2, 0))
-                                    
+
                                     orig_nii = nib.load(str(orig_img_path))
-                                    nifti_img = nib.Nifti1Image(resized_vol.astype(np.uint8), affine=orig_nii.affine)
+                                    nifti_img = nib.Nifti1Image(
+                                        resized_vol.astype(np.uint8),
+                                        affine=orig_nii.affine,
+                                    )
                                     val_3d_predictions.append((nifti_img, patient_stem))
                                 else:
                                     resized_vol = resize(
@@ -477,7 +505,9 @@ def runTraining(args):
                                         anti_aliasing=False,
                                     ).astype(np.uint8)
 
-                                    nifti_img = nib.Nifti1Image(resized_vol, affine=patient_affine)
+                                    nifti_img = nib.Nifti1Image(
+                                        resized_vol, affine=patient_affine
+                                    )
                                     val_3d_predictions.append((nifti_img, patient_stem))
                         else:
                             with warnings.catch_warnings():
@@ -608,6 +638,12 @@ def main():
     )
 
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument(
+        "--fused",
+        action="store_true",
+        default=True,
+        help="Enable fused Adam optimizer on GPU.",
+    )
     parser.add_argument(
         "--amp",
         default="bf16",
