@@ -4,10 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from typing import Tuple, Union
+
+# =====================================================================
+# Utilities & Normalization
+# =====================================================================
 
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Helper to dynamically choose a valid number of groups for GroupNorm."""
+    """Dynamic GroupNorm matching channel divisibility."""
     for g in [32, 16, 8, 4, 2]:
         if g <= max_groups and num_channels % g == 0:
             return nn.GroupNorm(g, num_channels)
@@ -15,7 +20,7 @@ def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
 
 
 def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tensor:
-    """Stochastic Depth / DropPath implementation for residual connections."""
+    """Stochastic Depth / DropPath implementation."""
     if drop_prob == 0.0 or not training:
         return x
     keep_prob = 1.0 - drop_prob
@@ -34,18 +39,24 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
-def random_weights_init(m: nn.Module) -> None:
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+def model_weights_init(m: nn.Module) -> None:
+    """Weight initialization matching MambaNet."""
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d)):
+    elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d, nn.LayerNorm)):
         nn.init.ones_(m.weight)
         nn.init.zeros_(m.bias)
 
 
+# =====================================================================
+# ConvNeXt & Attention Modules
+# =====================================================================
+
+
 class SqueezeExcite(nn.Module):
-    """Channel attention mechanism."""
+    """Channel attention with dynamic reduction."""
 
     def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
@@ -62,8 +73,12 @@ class SqueezeExcite(nn.Module):
         return x * self.fc(x)
 
 
-class DepthwiseSeparableBlock(nn.Module):
-    """ConvNeXt-style Large Kernel (7x7) Depthwise Separable Block."""
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt Inverted Bottleneck Block with LayerScale.
+
+    Serves as the spatial processing block and standard convolutional
+    substitute for Mamba2DBlock throughout ImprovedENet.
+    """
 
     def __init__(
         self,
@@ -71,30 +86,37 @@ class DepthwiseSeparableBlock(nn.Module):
         out_dim: int,
         kernel_size: int = 7,
         stride: int = 1,
+        expand_ratio: int = 4,
         drop_path_rate: float = 0.0,
+        layer_scale_init: float = 1e-6,
     ):
         super().__init__()
         padding = kernel_size // 2
+        hidden_dim = in_dim * expand_ratio
 
-        self.conv = nn.Sequential(
-            # Depthwise Large Kernel
-            nn.Conv2d(
-                in_dim,
-                in_dim,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=in_dim,
-                bias=False,
-            ),
-            get_group_norm(in_dim),
-            nn.SiLU(inplace=True),
-            # Pointwise expansion/projection
-            nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False),
-            get_group_norm(out_dim),
-            nn.SiLU(inplace=True),
+        self.dwconv = nn.Conv2d(
+            in_dim,
+            in_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_dim,
+            bias=False,
         )
+        self.norm = get_group_norm(in_dim)
+        self.pwconv1 = nn.Conv2d(in_dim, hidden_dim, kernel_size=1, bias=False)
+        self.act = nn.SiLU(inplace=True)
+        self.pwconv2 = nn.Conv2d(hidden_dim, out_dim, kernel_size=1, bias=False)
         self.se = SqueezeExcite(out_dim)
+
+        self.gamma = (
+            nn.Parameter(
+                layer_scale_init * torch.ones(out_dim, 1, 1), requires_grad=True
+            )
+            if layer_scale_init > 0
+            else None
+        )
+
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
@@ -108,22 +130,54 @@ class DepthwiseSeparableBlock(nn.Module):
             self.shortcut = nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.shortcut(x) + self.drop_path(self.se(self.conv(x)))
+        input_tensor = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.se(x)
+
+        if self.gamma is not None:
+            x = x * self.gamma
+
+        return self.shortcut(input_tensor) + self.drop_path(x)
+
+
+class SpatialAttentionGate(nn.Module):
+    """Attention Gate for skip feature filtering before decoder fusion."""
+
+    def __init__(self, gate_dim: int, skip_dim: int, inter_dim: int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_dim, inter_dim, kernel_size=1, bias=False),
+            get_group_norm(inter_dim),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_dim, inter_dim, kernel_size=1, bias=False),
+            get_group_norm(inter_dim),
+        )
+        self.psi = nn.Sequential(
+            nn.SiLU(inplace=True),
+            nn.Conv2d(inter_dim, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, g: Tensor, x: Tensor) -> Tensor:
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        alpha = self.psi(g1 + x1)
+        return x * alpha
 
 
 class LiteDepthwiseASPPModule(nn.Module):
-    """MobileNetV3-style Lite Atrous Spatial Pyramid Pooling.
-
-    Prevents parameter explosions by reducing intermediary channels.
-    """
+    """Lite Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
         mid_dim = max(16, in_dim // 4)
-
         self.branches = nn.ModuleList()
 
-        # 1x1 Conv Branch
         self.branches.append(
             nn.Sequential(
                 nn.Conv2d(in_dim, mid_dim, kernel_size=1, bias=False),
@@ -132,7 +186,6 @@ class LiteDepthwiseASPPModule(nn.Module):
             )
         )
 
-        # Dilated Depthwise Separable Branches
         for rate in rates[1:]:
             self.branches.append(
                 nn.Sequential(
@@ -151,7 +204,6 @@ class LiteDepthwiseASPPModule(nn.Module):
                 )
             )
 
-        # Global Pooling Branch
         self.glob_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_dim, mid_dim, kernel_size=1, bias=False),
@@ -159,7 +211,6 @@ class LiteDepthwiseASPPModule(nn.Module):
             nn.SiLU(inplace=True),
         )
 
-        # Projection back to target out_dim
         num_branches = len(rates) + 1
         self.project = nn.Sequential(
             nn.Conv2d(mid_dim * num_branches, out_dim, kernel_size=1, bias=False),
@@ -179,21 +230,34 @@ class LiteDepthwiseASPPModule(nn.Module):
         return self.project(torch.cat(res, dim=1))
 
 
+# =====================================================================
+# Decoder Block
+# =====================================================================
+
+
 class UpDecoderBlock(nn.Module):
+    """Attention-Gated Decoder Block with Skip Fusion."""
+
     def __init__(
-        self, in_dim: int, skip_dim: int, out_dim: int, drop_path_rate: float = 0.0
+        self,
+        in_dim: int,
+        skip_dim: int,
+        out_dim: int,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
-        concat_dim = in_dim + skip_dim
+        self.attn_gate = SpatialAttentionGate(
+            gate_dim=in_dim, skip_dim=skip_dim, inter_dim=out_dim // 2
+        )
 
-        # 1x1 projection reduces incoming concatenated channels before large kernels
+        concat_dim = in_dim + skip_dim
         self.reduce = nn.Sequential(
             nn.Conv2d(concat_dim, out_dim, kernel_size=1, bias=False),
             get_group_norm(out_dim),
             nn.SiLU(inplace=True),
         )
 
-        self.conv = DepthwiseSeparableBlock(
+        self.spatial = ConvNeXtBlock(
             out_dim, out_dim, kernel_size=7, drop_path_rate=drop_path_rate
         )
 
@@ -201,78 +265,95 @@ class UpDecoderBlock(nn.Module):
         x_up = F.interpolate(
             x, size=skip.shape[2:], mode="bilinear", align_corners=False
         )
-        fused = torch.cat([x_up, skip], dim=1)
-        return self.conv(self.reduce(fused))
+        skip_gated = self.attn_gate(g=x_up, x=skip)
+        reduced = self.reduce(torch.cat([x_up, skip_gated], dim=1))
+        return self.spatial(reduced)
+
+
+# =====================================================================
+# Main Architecture: ImprovedENet
+# =====================================================================
 
 
 class ImprovedENet(nn.Module):
+    """Pure CNN counterpart to MambaNet using ConvNeXt blocks in place of Mamba2D."""
+
     def __init__(
         self,
-        in_dim: int,
-        out_dim: int,
+        in_dim: int = 3,
+        out_dim: int = 1,
         drop_rate: float = 0.1,
         bottleneck_drop_rate: float = 0.2,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
-        # Base channels doubled (Default K=32 vs old K=16)
-        factor: int = kwargs.get("factor", 2)
-        K: int = max(32, kwargs.get("kernels", 16) * factor)
+        K: int = kwargs.get("kernels", 16)
 
-        # Stem (K = 32)
+        # Stem Layer
         self.stem = nn.Sequential(
             nn.Conv2d(in_dim, K, kernel_size=3, padding=1, bias=False),
             get_group_norm(K),
             nn.SiLU(inplace=True),
-            DepthwiseSeparableBlock(K, K, kernel_size=3, drop_path_rate=0.0),
+            ConvNeXtBlock(K, K, kernel_size=3, drop_path_rate=0.0),
         )
 
-        # Encoder (32 -> 64 -> 128 -> 256)
-        self.enc1 = DepthwiseSeparableBlock(
+        # Encoder Path (ConvNeXt substituted for Mamba2D)
+        self.enc1 = ConvNeXtBlock(
             K, K * 2, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.2
         )
 
         self.enc2 = nn.Sequential(
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 2, K * 4, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.4
             ),
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 4, K * 4, kernel_size=7, stride=1, drop_path_rate=drop_rate * 0.4
             ),
         )
 
         self.enc3 = nn.Sequential(
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 4, K * 8, kernel_size=7, stride=2, drop_path_rate=drop_rate * 0.6
             ),
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 8, K * 8, kernel_size=7, stride=1, drop_path_rate=drop_rate * 0.6
             ),
         )
 
-        # Bottleneck (~135k params: Lite-ASPP + DW Refinement)
+        # Bottleneck: Lite-ASPP + ConvNeXt Block Substitution
         self.bottleneck = nn.Sequential(
             LiteDepthwiseASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
-            DepthwiseSeparableBlock(
+            ConvNeXtBlock(
                 K * 8, K * 8, kernel_size=7, drop_path_rate=bottleneck_drop_rate
             ),
         )
 
-        # Decoder
+        # Decoder Path
         self.dec3 = UpDecoderBlock(
-            in_dim=K * 8, skip_dim=K * 4, out_dim=K * 4, drop_path_rate=drop_rate * 0.4
+            in_dim=K * 8,
+            skip_dim=K * 4,
+            out_dim=K * 4,
+            drop_path_rate=drop_rate * 0.4,
         )
         self.dec2 = UpDecoderBlock(
-            in_dim=K * 4, skip_dim=K * 2, out_dim=K * 2, drop_path_rate=drop_rate * 0.2
+            in_dim=K * 4,
+            skip_dim=K * 2,
+            out_dim=K * 2,
+            drop_path_rate=drop_rate * 0.2,
         )
         self.dec1 = UpDecoderBlock(
-            in_dim=K * 2, skip_dim=K, out_dim=K, drop_path_rate=0.0
+            in_dim=K * 2,
+            skip_dim=K,
+            out_dim=K,
+            drop_path_rate=0.0,
         )
 
         # Final Classifier
         self.final = nn.Conv2d(K, out_dim, kernel_size=1)
 
-    def forward(self, input: Tensor) -> Tensor:
+        self.apply(model_weights_init)
+
+    def forward(self, input: Tensor) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         if input.dim() == 5:
             B, Z, C, H, W = input.shape
             input = input.view(B, Z * C, H, W)
@@ -288,7 +369,8 @@ class ImprovedENet(nn.Module):
         d2 = self.dec2(d3, x1)
         d1 = self.dec1(d2, x0)
 
-        return self.final(d1)
+        out = self.final(d1)
+        return out
 
-    def init_weights(self, *args, **kwargs):
-        self.apply(random_weights_init)
+    def init_weights(self):
+        self.apply(model_weights_init)
