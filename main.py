@@ -99,7 +99,7 @@ models_params["ImprovedENet"] = {
 }
 models_params["MambaNet"] = {
     "net": MambaNet,
-    "args": {"kernels": 32, "factor": 2, "z_window": 15},
+    "args": {"kernels": 16, "factor": 2, "z_window": 15},
 }
 models_params["MambaNet3D"] = {
     "net": MambaNet3D,
@@ -176,6 +176,7 @@ def setup(
     DataLoader,
     int,
     bool,
+    torch.memory_format | None,
 ]:
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
@@ -208,6 +209,14 @@ def setup(
     net.init_weights()
     net = net.to(device=device)
 
+    # Automatically resolve memory format based on model dimensionality
+    memory_format = None
+    if getattr(args, "channels_last", False):
+        memory_format = torch.channels_last_3d if is_3d_model else torch.channels_last
+        net = net.to(memory_format=memory_format)
+        fmt_name = "channels_last_3d" if is_3d_model else "channels_last"
+        print(f">> Converted model parameters to {fmt_name} memory format.")
+
     B: int = (
         args.batch_size
         if hasattr(args, "batch_size")
@@ -217,10 +226,7 @@ def setup(
     if is_3d_model:
         summary_input_size = (B, 1, 128, 256, 256)
     else:
-        if z_window > 1:
-            summary_input_size = (B, z_window, 1, 256, 256)
-        else:
-            summary_input_size = (B, 1, 256, 256)
+        summary_input_size = (B, z_window, 256, 256)
 
     print("=== MODEL SUMMARY ===")
     try:
@@ -341,6 +347,7 @@ def setup(
         val_loader,
         K,
         is_3d_model,
+        memory_format,
     )
 
 
@@ -356,6 +363,7 @@ def runTraining(args):
         val_loader,
         K,
         is_3d_model,
+        memory_format,
     ) = setup(args)
 
     amp_enabled: bool = args.amp != "none" and device.type == "cuda"
@@ -402,6 +410,10 @@ def runTraining(args):
                 for i, data in tq_iter:
                     img = data["images"].to(device, non_blocking=True)
                     gt = data["gts"].to(device, non_blocking=True)
+
+                    if memory_format is not None:
+                        img = img.to(memory_format=memory_format)
+                        gt = gt.to(memory_format=memory_format)
 
                     if is_train:
                         optimizer_net.zero_grad(set_to_none=True)
@@ -648,6 +660,11 @@ def main():
         "--amp",
         default="bf16",
         choices=["none", "fp16", "bf16"],
+    )
+    parser.add_argument(
+        "--channels_last",
+        action="store_true",
+        help="Convert model weights and inputs to channels_last (NHWC/NDHWC) memory format.",
     )
     parser.add_argument(
         "--compile",

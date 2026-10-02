@@ -36,6 +36,7 @@ python -O main.py \
     --dataset segthor_train_full \
     --dest results/segthor/$MODEL \
     --gpu \
+    --channels_last \
     --compile
 
 echo "Computing Metrics..."

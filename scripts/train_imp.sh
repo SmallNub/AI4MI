@@ -36,8 +36,9 @@ python -O main.py \
     --dataset SEGTHOR \
     --dest results/segthor/$MODEL \
     --gpu \
-    --compile \
-    --augment
+    --channels_last \
+    --augment \
+    --compile
 
 echo "Post Processing..."
 
