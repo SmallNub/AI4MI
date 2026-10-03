@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import (
-    CosineAnnealingWarmRestarts,
+    CosineAnnealingLR,
     LinearLR,
     SequentialLR,
 )
@@ -95,15 +95,19 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 16, "factor": 2, "z_window": 15},
+    "args": {"kernels": 16, "z_window": 15},
+}
+models_params["ImprovedENet3D"] = {
+    "net": ImprovedENet3D,
+    "args": {"kernels": 16},
 }
 models_params["MambaNet"] = {
     "net": MambaNet,
-    "args": {"kernels": 16, "factor": 2, "z_window": 15},
+    "args": {"kernels": 16, "z_window": 15},
 }
 models_params["MambaNet3D"] = {
     "net": MambaNet3D,
-    "args": {"kernels": 2, "factor": 2},
+    "args": {"kernels": 2},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,
@@ -113,13 +117,9 @@ models_params["AttentionENet3D"] = {
     "net": AttentionENet3D,
     "args": {"kernels": 16, "factor": 4},
 }
-models_params["ImprovedENet3D"] = {
-    "net": ImprovedENet3D,
-    "args": {"kernels": 8, "factor": 2},
-}
 
 optimizer_params: dict[str, dict[str, Any]] = {}
-optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999)}}
+optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999), "fused": True}}
 optimizer_params["sgd"] = {"optim": torch.optim.SGD, "args": {}}
 
 
@@ -135,33 +135,51 @@ def gt_transform(K, img):
     return img[0]
 
 
-def build_scheduler(optimizer, warmup_epochs, total_epochs):
+def build_scheduler(
+    optimizer, warmup_epochs, total_epochs, first_cycle_epochs=7, eta_min=1e-6
+):
     if optimizer is None:
         return None
+
+    post_warmup_epochs = max(0, total_epochs - warmup_epochs)
+    cycle1_epochs = min(first_cycle_epochs, post_warmup_epochs)
+    cycle2_epochs = max(0, post_warmup_epochs - cycle1_epochs)
+
+    schedulers = []
+    milestones = []
+
     if warmup_epochs > 0 and total_epochs > warmup_epochs:
-        warmup_scheduler = LinearLR(
-            optimizer,
-            start_factor=0.1,
-            total_iters=warmup_epochs,
+        schedulers.append(
+            LinearLR(
+                optimizer, start_factor=0.1, total_iters=warmup_epochs
+            )
         )
-        cosine_scheduler = CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=8,
-            T_mult=2,
-            eta_min=1e-6,
+        milestones.append(warmup_epochs)
+
+    if cycle1_epochs > 0:
+        schedulers.append(
+            CosineAnnealingLR(
+                optimizer, T_max=cycle1_epochs, eta_min=eta_min
+            )
         )
-        return SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs],
+
+    if cycle2_epochs > 0:
+        milestones.append(milestones[-1] + cycle1_epochs if milestones else cycle1_epochs)
+        schedulers.append(
+            CosineAnnealingLR(
+                optimizer, T_max=cycle2_epochs, eta_min=eta_min
+            )
         )
-    else:
-        return CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=8,
-            T_mult=2,
-            eta_min=1e-6,
-        )
+
+    if not schedulers:
+        return None
+
+    if len(schedulers) == 1:
+        return schedulers[0]
+
+    return SequentialLR(
+        optimizer, schedulers=schedulers, milestones=milestones
+    )
 
 
 def setup(
@@ -254,12 +272,7 @@ def setup(
         "device": device,
     }
 
-    # Fused Optimizer support
-    optim_kwargs = dict(optimizer_params[args.optim]["args"])
-    if gpu and args.optim == "adam" and getattr(args, "fused", True):
-        optim_kwargs["fused"] = True
-        print(">> Using fused Adam optimizer")
-
+    optim_kwargs = optimizer_params[args.optim]["args"]
     optimizer_net = optimizer_params[args.optim]["optim"](
         net.parameters(), lr=args.lr, **optim_kwargs
     )
@@ -283,7 +296,7 @@ def setup(
                 **optim_kwargs,
             )
 
-    warmup_epochs = getattr(args, "warmup_epochs", 5)
+    warmup_epochs = getattr(args, "warmup_epochs", 3)
 
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
 
@@ -625,7 +638,7 @@ def main():
     parser.add_argument("--lr", default=0.0005, type=float)
     parser.add_argument(
         "--warmup-epochs",
-        default=5,
+        default=3,
         type=int,
     )
     parser.add_argument(
