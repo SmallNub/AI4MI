@@ -15,10 +15,10 @@ module load Python/3.12.3-GCCcore-13.3.0
 cd $HOME/ai4mi_project
 source ai4mi/bin/activate
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/SEGTHOR
-make data/SEGTHOR
+# rm -rf data/SEGTHOR
+# make data/SEGTHOR
 
 MODEL="imp100"
 

@@ -11,30 +11,13 @@ from torch import Tensor
 # =====================================================================
 
 
-class LayerNorm2d(nn.Module):
-    """Channels-last compatible LayerNorm across 4D tensors."""
-
-    def __init__(self, num_channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        if x.is_contiguous(memory_format=torch.channels_last):
-            # Compute mean and variance across channel dimension (dim=1)
-            u = x.mean(dim=1, keepdim=True)
-            s = (x - u).pow(2).mean(dim=1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            # Reshape parameters to match (1, C, 1, 1) with correct memory stride
-            w = self.weight.view(1, -1, 1, 1)
-            b = self.bias.view(1, -1, 1, 1)
-            return x * w + b
-        else:
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            return self.weight[:, None, None] * x + self.bias[:, None, None]
+def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    """Dynamic GroupNorm matching channel divisibility."""
+    effective_max = min(max_groups, max(1, num_channels // 2))
+    for g in [32, 16, 8, 4, 2]:
+        if g <= effective_max and num_channels % g == 0:
+            return nn.GroupNorm(g, num_channels)
+    return nn.GroupNorm(1, num_channels)
 
 
 def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tensor:
@@ -64,7 +47,7 @@ def model_weights_init(m: nn.Module) -> None:
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d, nn.LayerNorm, LayerNorm2d)):
+    elif isinstance(m, (nn.GroupNorm, nn.BatchNorm2d, nn.LayerNorm)):
         if m.weight is not None:
             nn.init.ones_(m.weight)
         if m.bias is not None:
@@ -95,11 +78,7 @@ class SqueezeExcite(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    """ConvNeXt Inverted Bottleneck Block with LayerNorm2d.
-
-    Uses channel-first LayerNorm for full channels_last compatibility
-    without LayerScale memory stride penalties.
-    """
+    """ConvNeXt Inverted Bottleneck Block with GroupNorm."""
 
     def __init__(
         self,
@@ -123,7 +102,7 @@ class ConvNeXtBlock(nn.Module):
             groups=in_dim,
             bias=False,
         )
-        self.norm = LayerNorm2d(in_dim)
+        self.norm = get_group_norm(in_dim)
         self.pwconv1 = nn.Conv2d(in_dim, hidden_dim, kernel_size=1, bias=False)
         self.act = nn.SiLU(inplace=True)
         self.pwconv2 = nn.Conv2d(hidden_dim, out_dim, kernel_size=1, bias=False)
@@ -136,7 +115,7 @@ class ConvNeXtBlock(nn.Module):
         if stride != 1 or in_dim != out_dim:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_dim, out_dim, kernel_size=1, stride=stride, bias=False),
-                LayerNorm2d(out_dim),
+                get_group_norm(out_dim),
             )
         else:
             self.shortcut = nn.Identity()
@@ -160,11 +139,11 @@ class SpatialAttentionGate(nn.Module):
         super().__init__()
         self.W_g = nn.Sequential(
             nn.Conv2d(gate_dim, inter_dim, kernel_size=1, bias=False),
-            LayerNorm2d(inter_dim),
+            get_group_norm(inter_dim),
         )
         self.W_x = nn.Sequential(
             nn.Conv2d(skip_dim, inter_dim, kernel_size=1, bias=False),
-            LayerNorm2d(inter_dim),
+            get_group_norm(inter_dim),
         )
         self.psi = nn.Sequential(
             nn.SiLU(inplace=True),
@@ -190,7 +169,7 @@ class LiteDepthwiseASPPModule(nn.Module):
         self.branches.append(
             nn.Sequential(
                 nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False),
-                LayerNorm2d(out_dim),
+                get_group_norm(out_dim),
                 nn.SiLU(inplace=True),
             )
         )
@@ -209,7 +188,7 @@ class LiteDepthwiseASPPModule(nn.Module):
                         bias=False,
                     ),
                     nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False),
-                    LayerNorm2d(out_dim),
+                    get_group_norm(out_dim),
                     nn.SiLU(inplace=True),
                 )
             )
@@ -218,14 +197,14 @@ class LiteDepthwiseASPPModule(nn.Module):
         self.glob_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_dim, out_dim, kernel_size=1, bias=False),
-            LayerNorm2d(out_dim),
+            get_group_norm(out_dim),
             nn.SiLU(inplace=True),
         )
 
         # Final projection & channel attention
         self.project = nn.Sequential(
             nn.Conv2d(out_dim, out_dim, kernel_size=1, bias=False),
-            LayerNorm2d(out_dim),
+            get_group_norm(out_dim),
             nn.SiLU(inplace=True),
             SqueezeExcite(out_dim),
         )
@@ -268,7 +247,7 @@ class UpDecoderBlock(nn.Module):
         concat_dim = in_dim + skip_dim
         self.reduce = nn.Sequential(
             nn.Conv2d(concat_dim, out_dim, kernel_size=1, bias=False),
-            LayerNorm2d(out_dim),
+            get_group_norm(out_dim),
             nn.SiLU(inplace=True),
         )
 
@@ -307,7 +286,7 @@ class ImprovedENet(nn.Module):
         # Stem Layer
         self.stem = nn.Sequential(
             nn.Conv2d(in_dim, K, kernel_size=3, padding=1, bias=False),
-            LayerNorm2d(K),
+            get_group_norm(K),
             nn.SiLU(inplace=True),
             ConvNeXtBlock(K, K, kernel_size=3, drop_path_rate=0.0),
         )

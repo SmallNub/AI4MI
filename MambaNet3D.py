@@ -18,7 +18,7 @@ except ImportError:
 
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching channel divisibility (works for 3D tensors)."""
+    """Dynamic GroupNorm matching channel divisibility."""
     effective_max = min(max_groups, max(1, num_channels // 2))
     for g in [32, 16, 8, 4, 2]:
         if g <= effective_max and num_channels % g == 0:
