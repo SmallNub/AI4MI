@@ -248,6 +248,7 @@ def setup(
 
     print("=== MODEL SUMMARY ===")
     try:
+        net.eval()
         summary(net, input_size=summary_input_size, device=device.type)
     except Exception as e:
         print(f">> Model summary failed with input shape {summary_input_size}: {e}")
@@ -439,9 +440,22 @@ def runTraining(args):
                     with torch.autocast(
                         device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
                     ):
-                        pred_logits = net(img)
+                        out = net(img)
+                        
+                        # Unpack outputs if Deep Supervision returns a tuple (main_logits, aux_logits)
+                        if isinstance(out, tuple):
+                            pred_logits, aux_logits = out
+                            aux_probs = F.softmax(1 * aux_logits, dim=1)
+                            loss_aux, *_ = loss_fn(aux_probs, gt)
+                        else:
+                            pred_logits = out
+                            loss_aux = 0.0
+
                         pred_probs = F.softmax(1 * pred_logits, dim=1)
-                        loss, *loss_info = loss_fn(pred_probs, gt)
+                        loss_main, *loss_info = loss_fn(pred_probs, gt)
+
+                        # Combine main and auxiliary loss (0.4 weighting factor for Deep Supervision)
+                        loss = loss_main + 0.4 * loss_aux if isinstance(out, tuple) else loss_main
 
                     with torch.no_grad():
                         pred_seg = probs2one_hot(pred_probs)
