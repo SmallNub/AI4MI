@@ -425,9 +425,8 @@ class Segthor3DDataset(Dataset):
             affine = ct_nii.affine
             orig_shape = ct.shape
 
-        norm_ct = norm_arr(ct)
         ct_tensor = (
-            torch.from_numpy(norm_ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
+            torch.from_numpy(ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
         )
 
         ct_resized = torch.nn.functional.interpolate(

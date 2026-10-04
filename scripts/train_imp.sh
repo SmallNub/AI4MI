@@ -15,12 +15,17 @@ module load Python/3.12.3-GCCcore-13.3.0
 cd $HOME/ai4mi_project
 source ai4mi/bin/activate
 
-# echo "Data Preprocessing..."
+echo "Data Preprocessing..."
 
-# rm -rf data/SEGTHOR
-# make data/SEGTHOR
+rm -rf data/segthor_processed
+python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
-MODEL="imp100"
+echo "Slicing..."
+
+rm -rf data/SEGTHOR_processed
+make data/SEGTHOR_processed
+
+MODEL="imp50"
 
 echo "Training..."
 
@@ -31,9 +36,9 @@ python -O main.py \
     --batch_size 32 \
     --clip-grad 1.0 \
     --lr 0.001 \
-    --epochs 100 \
+    --epochs 50 \
     --warmup-epochs 3 \
-    --dataset SEGTHOR \
+    --dataset SEGTHOR_processed \
     --dest results/segthor/$MODEL \
     --gpu \
     --channels_last \
@@ -42,11 +47,13 @@ python -O main.py \
 
 echo "Post Processing..."
 
-python stitch.py --data_folder results/segthor/$MODEL/best_epoch/val \
-    --dest_folder volumes/segthor/$MODEL \
-    --num_classes 255 \
-    --grp_regex "(Patient_\d\d)_\d\d\d\d" \
-    --source_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz"
+python postprocess.py \
+    --pred_dir results/segthor/$MODEL/best_epoch/val \
+    --raw_dir data/segthor_train_full/train/ \
+    --preprocessed_dir data/segthor_processed/train/ \
+    --output_dir volumes/segthor/$MODEL \
+    --is_2d_input \
+    -p 4
 
 echo "Computing Metrics..."
 

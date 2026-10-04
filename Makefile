@@ -28,5 +28,12 @@ data/SEGTHOR:
 	$(info $(green)python $(CFLAGS) slice_segthor.py$(reset))
 	rm -rf $@_tmp $@
 	python $(CFLAGS) slice_segthor.py --source_dir data/segthor_train_full --dest_dir $@_tmp \
-		--shape 256 256 --retain 5
+		--shape 256 256 --retain 5 -p 4
+	mv $@_tmp $@
+
+data/SEGTHOR_processed:
+	$(info $(green)python $(CFLAGS) slice_segthor.py$(reset))
+	rm -rf $@_tmp $@
+	python $(CFLAGS) slice_segthor.py --source_dir data/segthor_processed --dest_dir $@_tmp \
+		--shape 256 256 --retain 5 -p 4 --skip_preprocessing
 	mv $@_tmp $@

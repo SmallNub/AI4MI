@@ -74,8 +74,10 @@ from hypll.optim import RiemannianAdam
 datasets_params: dict[str, dict[str, Any]] = {}
 datasets_params["TOY2"] = {"K": 2, "B": 2}
 datasets_params["SEGTHOR"] = {"K": 5, "B": 8}
-datasets_params["SEGTHOR_CLEAN"] = {"K": 5, "B": 8}
+datasets_params["SEGTHOR_processed"] = {"K": 5, "B": 8}
 datasets_params["segthor_train_full"] = {"K": 5, "B": 4}
+datasets_params["segthor_processed"] = {"K": 5, "B": 4}
+
 
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
@@ -126,7 +128,10 @@ models_params["AttentionENet3D"] = {
 }
 
 optimizer_params: dict[str, dict[str, Any]] = {}
-optimizer_params["adam"] = {"optim": torch.optim.Adam, "args": {"betas": (0.9, 0.999), "fused": True}}
+optimizer_params["adam"] = {
+    "optim": torch.optim.Adam,
+    "args": {"betas": (0.9, 0.999), "fused": True},
+}
 optimizer_params["sgd"] = {"optim": torch.optim.SGD, "args": {}}
 
 
@@ -157,25 +162,21 @@ def build_scheduler(
 
     if warmup_epochs > 0 and total_epochs > warmup_epochs:
         schedulers.append(
-            LinearLR(
-                optimizer, start_factor=0.1, total_iters=warmup_epochs
-            )
+            LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
         )
         milestones.append(warmup_epochs)
 
     if cycle1_epochs > 0:
         schedulers.append(
-            CosineAnnealingLR(
-                optimizer, T_max=cycle1_epochs, eta_min=eta_min
-            )
+            CosineAnnealingLR(optimizer, T_max=cycle1_epochs, eta_min=eta_min)
         )
 
     if cycle2_epochs > 0:
-        milestones.append(milestones[-1] + cycle1_epochs if milestones else cycle1_epochs)
+        milestones.append(
+            milestones[-1] + cycle1_epochs if milestones else cycle1_epochs
+        )
         schedulers.append(
-            CosineAnnealingLR(
-                optimizer, T_max=cycle2_epochs, eta_min=eta_min
-            )
+            CosineAnnealingLR(optimizer, T_max=cycle2_epochs, eta_min=eta_min)
         )
 
     if not schedulers:
@@ -184,9 +185,7 @@ def build_scheduler(
     if len(schedulers) == 1:
         return schedulers[0]
 
-    return SequentialLR(
-        optimizer, schedulers=schedulers, milestones=milestones
-    )
+    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
 
 
 def setup(
@@ -203,6 +202,12 @@ def setup(
     bool,
     torch.memory_format | None,
 ]:
+    # Delete existing target folder to avoid saving artifacts or state collisions
+    if args.dest.exists():
+        print(f">> Removing existing output directory: {args.dest}")
+        rmtree(args.dest)
+    args.dest.mkdir(parents=True, exist_ok=True)
+
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
@@ -373,8 +378,6 @@ def setup(
         pin_memory=gpu,
     )
 
-    args.dest.mkdir(parents=True, exist_ok=True)
-
     return (
         net,
         (optimizer_net, optimizer_riemannian, optimizer_loss),
@@ -467,7 +470,7 @@ def runTraining(args):
                         device_type=device.type, dtype=amp_dtype, enabled=amp_enabled
                     ):
                         out = net(img)
-                        
+
                         # Unpack outputs if Deep Supervision returns a tuple (main_logits, aux_logits)
                         if isinstance(out, tuple):
                             pred_logits, aux_logits = out
@@ -481,7 +484,11 @@ def runTraining(args):
                         loss_main, *loss_info = loss_fn(pred_probs, gt)
 
                         # Combine main and auxiliary loss (0.4 weighting factor for Deep Supervision)
-                        loss = loss_main + 0.4 * loss_aux if isinstance(out, tuple) else loss_main
+                        loss = (
+                            loss_main + 0.4 * loss_aux
+                            if isinstance(out, tuple)
+                            else loss_main
+                        )
 
                     with torch.no_grad():
                         pred_seg = probs2one_hot(pred_probs)
