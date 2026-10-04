@@ -366,6 +366,20 @@ class ImprovedENet(nn.Module):
 
         self.apply(model_weights_init)
 
+    @torch.compiler.disable
+    def _hyperbolic_head(self, d1: Tensor) -> Tensor:
+        with torch.autocast(device_type=d1.device.type, enabled=False):
+            d1 = d1.float()
+            norm = d1.norm(dim=1, keepdim=True).clamp_min(1e-6)
+            d1 = d1 * (self.clip_r / norm).clamp(max=1.0)
+
+            tangent_d1 = TangentTensor(data=d1, manifold=self.manifold, man_dim=1)
+            hyperbolic_d1 = self.manifold.expmap(tangent_d1)
+            hyperbolic_features = self.h_conv(hyperbolic_d1)
+            tangent_out = self.manifold.logmap(None, hyperbolic_features)
+            return self.final_logits(tangent_out.tensor)
+
+
     def forward(self, input: Tensor) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
         x0 = self.stem(input)
         x1 = self.enc1(x0)
@@ -379,20 +393,7 @@ class ImprovedENet(nn.Module):
         
         d1 = self.dec1(d2, x0)
 
-        with torch.autocast(device_type=d1.device.type, enabled=False):
-            d1 = d1.float()
-
-            norm = d1.norm(dim=1, keepdim=True).clamp_min(1e-6)
-            d1 = d1 * (self.clip_r / norm).clamp(max=1.0)
-
-            tangent_d1 = TangentTensor(data=d1, manifold=self.manifold, man_dim=1)
-            hyperbolic_d1 = self.manifold.expmap(tangent_d1)
-            hyperbolic_features = self.h_conv(hyperbolic_d1)
-
-            tangent_out = self.manifold.logmap(None, hyperbolic_features)
-            out = self.final_logits(tangent_out.tensor)
-
-        return out
+        return self._hyperbolic_head(d1)
 
     def init_weights(self):
         self.apply(model_weights_init)
