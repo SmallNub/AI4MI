@@ -349,7 +349,18 @@ def main() -> None:
         )
     )
     parser.add_argument(
-        "--input_folder", type=Path, help="Folder containing predicted .nii.gz volumes"
+        "--input_folder",
+        type=Path,
+        help="Folder containing predicted .nii.gz volumes",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "Recursively discover .nii.gz predictions below --input_folder. "
+            "Use this for nested layouts such as "
+            "INPUT/Patient_01/Patient_01.nii.gz."
+        ),
     )
     parser.add_argument(
         "--output_folder", type=Path, help="New folder for processed .nii.gz volumes"
@@ -390,9 +401,26 @@ def main() -> None:
     if not args.input_folder.is_dir():
         raise FileNotFoundError(args.input_folder)
 
-    volumes = sorted(args.input_folder.glob("*.nii.gz"))
+    search = args.input_folder.rglob if args.recursive else args.input_folder.glob
+    volumes = sorted(
+        path
+        for path in search("*.nii.gz")
+        if path.is_file()
+    )
+
     if not volumes:
-        raise FileNotFoundError(f"No .nii.gz volumes found in {args.input_folder}")
+        mode = "recursively below" if args.recursive else "directly inside"
+        raise FileNotFoundError(
+            f"No .nii.gz volumes found {mode} {args.input_folder}"
+        )
+
+    names = [path.name for path in volumes]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError(
+            "Recursive input contains duplicate NIfTI filenames, which would "
+            f"collide in the flat output folder: {duplicate_names}"
+        )
 
     policy = load_policy(args.preset, args.config)
     args.output_folder.mkdir(parents=True, exist_ok=True)
