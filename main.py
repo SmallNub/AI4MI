@@ -22,6 +22,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+
+import os
 import argparse
 import warnings
 from typing import Any
@@ -256,7 +258,7 @@ def setup(
     if is_3d_model:
         summary_input_size = (B, 1, 128, 256, 256)
     else:
-        summary_input_size = (B, z_window, 256, 256)
+        summary_input_size = (B, z_window, 512, 512)
 
     print("=== MODEL SUMMARY ===")
     try:
@@ -355,8 +357,8 @@ def setup(
     train_loader = DataLoader(
         train_set,
         batch_size=B,
-        num_workers=4 if is_3d_model else 8,
-        prefetch_factor=2,
+        num_workers=8 if os.environ.get("IS_SNELLIUS", 0) == 1 else 4,
+        prefetch_factor=2 if os.environ.get("IS_SNELLIUS", 0) == 1 else 1,
         worker_init_fn=seed_worker,
         generator=torch.Generator().manual_seed(args.seed),
         shuffle=True,
@@ -372,8 +374,8 @@ def setup(
     val_loader = DataLoader(
         val_set,
         batch_size=B,
-        num_workers=4 if is_3d_model else 8,
-        prefetch_factor=2,
+        num_workers=8 if os.environ.get("IS_SNELLIUS", 0) == 1 else 4,
+        prefetch_factor=2 if os.environ.get("IS_SNELLIUS", 0) == 1 else 1,
         shuffle=False,
         pin_memory=gpu,
     )

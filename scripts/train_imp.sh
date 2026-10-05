@@ -15,6 +15,8 @@ module load Python/3.12.3-GCCcore-13.3.0
 cd $HOME/ai4mi_project
 source ai4mi/bin/activate
 
+export IS_SNELLIUS=1
+
 echo "Data Preprocessing..."
 
 rm -rf data/segthor_processed

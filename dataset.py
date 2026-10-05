@@ -30,7 +30,6 @@ import numpy as np
 import torch
 import nibabel as nib
 import SimpleITK as sitk
-from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
@@ -249,11 +248,12 @@ class SliceDataset(Dataset):
         self.full_files = make_dataset(root_dir, subset)
 
         if self.drop_empty and not self.test_mode:
-            print(f">> Filtering empty slices for {subset}...")
+            print(f">> Filtering empty slices lazily for {subset}...")
             self.valid_indices = []
             for idx, (_, gt_path) in enumerate(self.full_files):
                 if gt_path is not None:
-                    gt_arr = np.array(Image.open(gt_path))
+                    # Memory-map the .npy file to inspect data lazily without allocating RAM
+                    gt_arr = np.load(gt_path, mmap_mode="r")
                     has_target_organs = np.any((gt_arr > 0) & (gt_arr <= 252))
                     if has_target_organs:
                         self.valid_indices.append(idx)
@@ -348,7 +348,7 @@ class Segthor3DDataset(Dataset):
         self.gt_transform = gt_transform
         self.augment = augment
         self.test_mode = subset == "test"
-        self.shape = (256, 256)
+        self.shape = (128, 256, 256)
         self.resample = resample
         self.target_spacing = target_spacing
 
@@ -399,7 +399,6 @@ class Segthor3DDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         patient_id = self.files[index]
         patient_path = self.data_path / patient_id
-        target_z = 128
 
         # 1. Load CT Volume
         ct_path = patient_path / f"{patient_id}.nii.gz"
@@ -431,7 +430,7 @@ class Segthor3DDataset(Dataset):
 
         ct_resized = torch.nn.functional.interpolate(
             ct_tensor,
-            size=(target_z, self.shape[0], self.shape[1]),
+            size=self.shape,
             mode="trilinear",
             align_corners=False,
         ).squeeze(
@@ -466,7 +465,7 @@ class Segthor3DDataset(Dataset):
             gt_resized = (
                 torch.nn.functional.interpolate(
                     gt_tensor,
-                    size=(target_z, self.shape[0], self.shape[1]),
+                    size=self.shape,
                     mode="nearest",
                 )
                 .squeeze(0)
