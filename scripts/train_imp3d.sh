@@ -30,6 +30,9 @@ python -O main.py \
     --model ImprovedENet3D \
     --loss compound \
     --use_focal \
+    --patch_size 32 128 128 \
+    --samples_per_volume 4 \
+    --val_batch_size 8 \
     --batch_size 4 \
     --clip-grad 1.0 \
     --lr 0.001 \
