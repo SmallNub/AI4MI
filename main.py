@@ -54,9 +54,9 @@ from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
 from MambaNet import MambaNet
 from MambaNet3D import MambaNet3D
 from ImprovedENet import ImprovedENet
-from ImprovedENet_hyperbolic import ImprovedENet as HypImprovedENet
 from ImprovedENet3D import ImprovedENet3D
 from ENet3D import ENet3D, AttentionENet3D
+from ViT import ViT
 from utils import (
     Dcm,
     class2one_hot,
@@ -70,7 +70,6 @@ from utils import (
 )
 
 from losses import CrossEntropy, FocalLoss, GeneralizedDice, CompoundLoss
-from hypll.optim import RiemannianAdam
 
 
 datasets_params: dict[str, dict[str, Any]] = {}
@@ -104,9 +103,9 @@ models_params["ImprovedENet"] = {
     "net": ImprovedENet,
     "args": {"kernels": 16, "z_window": 15},
 }
-models_params["HypImprovedENet"] = {
-    "net": HypImprovedENet,
-    "args": {"kernels": 16, "z_window": 15, "curvature": 0.1, "clip_r": 2.3},
+models_params["ViT"] = {
+    "net": ViT,
+    "args": {"kernels": 16, "z_window": 15},
 }
 models_params["ImprovedENet3D"] = {
     "net": ImprovedENet3D,
@@ -289,7 +288,6 @@ def setup(
 
     optim_kwargs = optimizer_params[args.optim]["args"]
     
-    # SPLIT PARAMETERS FOR HYBRID OPTIMIZATION
     hyperbolic_params = []
     euclidean_params = []
     for name, param in net.named_parameters():
@@ -301,12 +299,6 @@ def setup(
     optimizer_net = optimizer_params[args.optim]["optim"](
         euclidean_params, lr=args.lr, **optim_kwargs
     )
-    # Baseline (Euclidean) models have no hyperbolic params -> no Riemannian optimizer.
-    optimizer_riemannian = (
-        RiemannianAdam(hyperbolic_params, lr=args.lr) if hyperbolic_params else None
-    )
-    if optimizer_riemannian is not None:
-        print(f">> Riemannian optimizer on {len(hyperbolic_params)} hyperbolic params")
 
     optimizer_loss = None
     if args.loss == "ce":
@@ -330,7 +322,6 @@ def setup(
     warmup_epochs = getattr(args, "warmup_epochs", 3)
 
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
-    scheduler_riem = build_scheduler(optimizer_riemannian, warmup_epochs, args.epochs)
 
     root_dir = Path("data") / args.dataset
 
@@ -382,8 +373,8 @@ def setup(
 
     return (
         net,
-        (optimizer_net, optimizer_riemannian, optimizer_loss),
-        (scheduler_net, scheduler_riem, None),
+        (optimizer_net, optimizer_loss),
+        (scheduler_net, None),
         loss_fn,
         device,
         train_loader,
@@ -398,8 +389,8 @@ def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
     (
         net,
-        (optimizer_net, optimizer_riemannian, optimizer_loss),
-        (scheduler_net, scheduler_riem, scheduler_loss),
+        (optimizer_net, optimizer_loss),
+        (scheduler_net, scheduler_loss),
         loss_fn,
         device,
         train_loader,
@@ -460,8 +451,6 @@ def runTraining(args):
 
                     if is_train:
                         optimizer_net.zero_grad(set_to_none=True)
-                        if optimizer_riemannian:
-                            optimizer_riemannian.zero_grad(set_to_none=True)
                         if optimizer_loss:
                             optimizer_loss.zero_grad(set_to_none=True)
 
@@ -503,8 +492,6 @@ def runTraining(args):
 
                         if args.clip_grad > 0:
                             scaler.unscale_(optimizer_net)
-                            if optimizer_riemannian:
-                                scaler.unscale_(optimizer_riemannian)
                             torch.nn.utils.clip_grad_norm_(
                                 net.parameters(), max_norm=args.clip_grad
                             )
@@ -515,8 +502,6 @@ def runTraining(args):
                                 )
 
                         scaler.step(optimizer_net)
-                        if optimizer_riemannian:
-                            scaler.step(optimizer_riemannian)
                         if optimizer_loss:
                             scaler.step(optimizer_loss)
 
@@ -629,8 +614,6 @@ def runTraining(args):
                     tq_iter.set_postfix(postfix_dict)
 
         scheduler_net.step()
-        if scheduler_riem:
-            scheduler_riem.step()
         if scheduler_loss:
             scheduler_loss.step()
 
