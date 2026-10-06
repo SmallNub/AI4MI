@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Universal Post-Processing & Spatial Resampling Pipeline
--------------------------------------------------------
-Handles predictions from both 2D models (slice stitching) and 3D models (3D NIfTI).
-Applies organ-specific 3D morphological post-processing and resamples prediction masks
-back to the exact raw CT physical reference space.
+Universal Post-Processing & Spatial Remapping Pipeline
+------------------------------------------------------
+1. Stitches 2D slice predictions (.png / .npy) or reads 3D model predictions in preprocessed space.
+2. Applies organ-specific 3D post-processing in native (X, Y, Z) array space.
+3. Maps predictions back to the preprocessed CT NIfTI header/affine.
+4. Resamples the segmentation back to the original raw CT physical space using SimpleITK.
 """
 
 import argparse
 import re
+import shutil
 from collections import defaultdict
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import nibabel as nib
 import numpy as np
@@ -30,19 +32,29 @@ from tqdm import tqdm
 
 
 # ==============================================================================
-# 1. ORGAN-SPECIFIC 3D POST-PROCESSING
+# 1. ORGAN-SPECIFIC 3D POST-PROCESSING (Native X, Y, Z Layout)
 # ==============================================================================
 def post_process_3d(
     arr: np.ndarray,
     num_classes: int = 5,
     crop_z_margins: bool = False,
 ) -> np.ndarray:
-    """Organ-specific 3D post-processing tailored for axial CT volumes (H, W, Z)."""
+    """
+    Organ-specific 3D post-processing tailored for axial CT volumes.
+    Iterates sequentially through class indices 1 to 4.
+    Input shape expected: (X, Y, Z) where Z is the axial slice index.
+
+    Classes:
+        1: Esophagus
+        2: Heart
+        3: Trachea
+        4: Aorta
+    """
     cleaned_arr = np.zeros_like(arr, dtype=np.uint8)
     struct_3d_26 = generate_binary_structure(3, 3)
     struct_2d_8 = generate_binary_structure(2, 2)
 
-    H, W, Z = arr.shape
+    X, Y, Z = arr.shape
     z_min, z_max = 0, Z
     if crop_z_margins:
         z_min = int(Z * 0.05)
@@ -53,7 +65,7 @@ def post_process_3d(
         if not mask.any():
             continue
 
-        # Class 1: Esophagus (Thin vertical structure)
+        # Class 1: Esophagus (Thin vertical structure across axial slices)
         if c == 1:
             labeled_mask, num_features = label(mask, structure=struct_3d_26)
             if num_features > 0:
@@ -98,7 +110,7 @@ def post_process_3d(
             z_kernel[0, 0, :] = True
             mask = binary_closing(mask, structure=z_kernel)
 
-        # Class 4: Aorta (Ascending/Descending sections)
+        # Class 4: Aorta (Ascending/Descending tubular sections)
         elif c == 4:
             for z in range(mask.shape[2]):
                 if mask[:, :, z].any():
@@ -124,65 +136,24 @@ def post_process_3d(
 
 
 # ==============================================================================
-# 2. 2D SLICE STITCHER TO SITK IMAGE
+# 2. HELPER FUNCTIONS
 # ==============================================================================
-def stitch_2d_slices_to_sitk(
-    patient_id: str,
-    slice_files: List[Path],
-    ref_nifti_path: Path,
-    num_classes: int = 5,
-) -> sitk.Image:
-    """Stitches 2D slice predictions into a 3D SimpleITK image using the reference volume's spatial metadata."""
-    ref_sitk = sitk.ReadImage(str(ref_nifti_path))
-    # SimpleITK GetSize() returns (X, Y, Z) / (Width, Height, Depth)
-    target_X, target_Y, target_Z = ref_sitk.GetSize()
-
-    # Sort slice files numerically by Z index in filename
-    sorted_files = sorted(
-        slice_files, key=lambda p: int(re.search(r"(\d+)(?=\.[^.]+$)", p.name).group(1))
-    )
-
-    if len(sorted_files) != target_Z:
-        raise ValueError(
-            f"Slice count mismatch for {patient_id}: Found {len(sorted_files)} slice files, "
-            f"but reference volume Z-depth is {target_Z}."
-        )
-
-    # SimpleITK's GetImageFromArray expects numpy shape: (Z, Y, X) -> (Depth, Height, Width)
-    vol_arr = np.zeros((target_Z, target_Y, target_X), dtype=np.uint8)
-
-    for z_idx, slice_path in enumerate(sorted_files):
-        if slice_path.suffix == ".npy":
-            slice_data = np.load(slice_path)
-        else:
-            slice_data = imread(slice_path)
-            if slice_data.max() > num_classes:
-                slice_data = (slice_data // 63).astype(np.uint8)
-
-        # Ensure slice matches 2D dimensions (Y, X) / (H, W)
-        if slice_data.shape != (target_Y, target_X):
-            slice_data = resize(
-                slice_data,
-                (target_Y, target_X),
-                order=0,
-                preserve_range=True,
-                anti_aliasing=False,
-            ).astype(np.uint8)
-
-        # Place slice directly at Z index
-        vol_arr[z_idx, :, :] = slice_data
-
-    # Convert NumPy array (Z, Y, X) directly to SimpleITK (X, Y, Z)
-    out_sitk = sitk.GetImageFromArray(vol_arr)
-    out_sitk.CopyInformation(ref_sitk)
-    return out_sitk
+def get_z_index(filepath: Path) -> int:
+    """Extracts axial slice integer z-index from file name."""
+    match = re.search(r"_(\d+)\.[^.]+$", filepath.name)
+    if match:
+        return int(match.group(1))
+    return int(filepath.stem.split("_")[-1])
 
 
-# ==============================================================================
-# 3. PHYSICAL RESAMPLING TO RAW REFERENCE CT
-# ==============================================================================
-def resample_to_raw_reference(pred_sitk: sitk.Image, raw_ct_path: Path) -> sitk.Image:
-    """Resamples a 3D predicted SimpleITK image to match raw CT physical reference."""
+def resample_mask_to_raw_ct(
+    segmented_nii_path: Path, raw_ct_path: Path, output_path: Path
+):
+    """
+    Resamples a 3D segmentation volume in preprocessed physical space back
+    to match the original raw CT physical spatial resolution, origin, and bounds.
+    """
+    seg_sitk = sitk.ReadImage(str(segmented_nii_path))
     raw_sitk = sitk.ReadImage(str(raw_ct_path))
 
     resampler = sitk.ResampleImageFilter()
@@ -190,131 +161,152 @@ def resample_to_raw_reference(pred_sitk: sitk.Image, raw_ct_path: Path) -> sitk.
     resampler.SetInterpolator(sitk.sitkNearestNeighbor)
     resampler.SetDefaultPixelValue(0)
 
-    resampled = resampler.Execute(pred_sitk)
-    return sitk.Cast(resampled, sitk.sitkUInt8)
+    resampled = resampler.Execute(seg_sitk)
+    sitk.WriteImage(sitk.Cast(resampled, sitk.sitkUInt8), str(output_path))
 
 
 # ==============================================================================
-# 4. PATIENT WORKFLOW EXECUTION
+# 3. 2D & 3D PATIENT MERGING PIPELINE
 # ==============================================================================
 def process_patient(
     patient_id: str,
     pred_dir: Path,
-    raw_dir: Path,
-    preprocessed_dir: Optional[Path],
+    preprocessed_scan_pattern: str,
+    raw_scan_pattern: str,
     output_dir: Path,
-    num_classes: int,
-    apply_post: bool,
-    is_2d_input: bool,
+    num_classes: int = 5,
+    apply_post: bool = True,
+    is_2d_input: bool = True,
 ) -> None:
-    # 1. Locate Raw CT Reference File
-    raw_candidates = [
-        raw_dir / "train" / patient_id / f"{patient_id}.nii.gz",
-        raw_dir / "test" / patient_id / f"{patient_id}.nii.gz",
-        raw_dir / "test" / f"{patient_id}.nii.gz",
-        raw_dir / patient_id / f"{patient_id}.nii.gz",
-    ]
-    raw_ct_path = next((p for p in raw_candidates if p.exists()), None)
-    if raw_ct_path is None:
-        print(f"[Warning] Raw CT reference not found for {patient_id}")
+    # 1. Load Preprocessed Reference Volume (X, Y, Z) via Nibabel
+    prep_nii_path = Path(preprocessed_scan_pattern.format(id_=patient_id))
+    if not prep_nii_path.exists():
+        print(f"[Warning] Preprocessed reference NIfTI not found: {prep_nii_path}")
         return
 
-    # 2. Load or Stitch Prediction to 3D SimpleITK Image
+    orig_nib = nib.load(str(prep_nii_path))
+    X, Y, Z = orig_nib.shape
+
+    out_nii_path = output_dir / f"{patient_id}.nii.gz"
+
     if is_2d_input:
-        if preprocessed_dir is None:
-            raise ValueError(
-                "`--preprocessed_dir` must be provided when processing 2D slice predictions."
-            )
-
-        prep_candidates = [
-            preprocessed_dir / "train" / patient_id / f"{patient_id}.nii.gz",
-            preprocessed_dir / "val" / patient_id / f"{patient_id}.nii.gz",
-            preprocessed_dir / "test" / patient_id / f"{patient_id}.nii.gz",
-            preprocessed_dir / patient_id / f"{patient_id}.nii.gz",
+        # Collect and sort 2D slice files for this patient
+        slice_files = [
+            p
+            for p in pred_dir.glob(f"{patient_id}_*")
+            if p.suffix in [".png", ".npy", ".jpg", ".tif"]
         ]
-        prep_ct_path = next((p for p in prep_candidates if p.exists()), None)
-        if prep_ct_path is None:
-            print(f"[Warning] Preprocessed NIfTI reference not found for {patient_id}")
+        if not slice_files:
+            print(f"[Warning] No 2D slice files found for patient {patient_id}")
             return
 
-        slice_files = list(pred_dir.glob(f"{patient_id}_*"))
-        pred_sitk = stitch_2d_slices_to_sitk(
-            patient_id, slice_files, prep_ct_path, num_classes=num_classes
-        )
+        assert (
+            len(slice_files) == Z
+        ), f"Slice count mismatch for patient {patient_id}: prep scan Z={Z}, slices={len(slice_files)}"
+
+        res_arr = np.zeros((X, Y, Z), dtype=np.uint8)
+
+        for slice_path in slice_files:
+            z = get_z_index(slice_path)
+            if slice_path.suffix == ".npy":
+                img_arr = np.load(slice_path)
+            else:
+                img_arr = imread(slice_path)
+
+            if img_arr.max() > num_classes:
+                img_arr = (img_arr // 63).astype(np.uint8)
+
+            # Resize to preprocessed target (X, Y) using nearest-neighbor interpolation
+            if img_arr.shape != (X, Y):
+                resized = resize(
+                    img_arr,
+                    (X, Y),
+                    mode="constant",
+                    preserve_range=True,
+                    anti_aliasing=False,
+                    order=0,
+                ).astype(np.uint8)
+            else:
+                resized = img_arr.astype(np.uint8)
+
+            res_arr[:, :, z] = resized
+
     else:
-        # 3D Model Output Input
-        pred_candidates = [
-            pred_dir / patient_id / f"{patient_id}.nii.gz",
-            pred_dir / patient_id / "pred.nii.gz",
-            pred_dir / f"{patient_id}.nii.gz",
-        ]
-        pred_path = next((p for p in pred_candidates if p.exists()), None)
-        if pred_path is None:
-            print(f"[Warning] 3D prediction file not found for {patient_id}")
+        # 3D Model NIfTI input
+        pred_3d_path = pred_dir / f"{patient_id}.nii.gz"
+        if not pred_3d_path.exists():
+            pred_3d_path = pred_dir / patient_id / f"{patient_id}.nii.gz"
+
+        if not pred_3d_path.exists():
+            print(f"[Warning] 3D prediction NIfTI not found for {patient_id}")
             return
-        pred_sitk = sitk.ReadImage(str(pred_path))
 
-    # 3. Apply 3D Morphological Post-Processing
+        pred_nib = nib.load(str(pred_3d_path))
+        res_arr = np.asarray(pred_nib.dataobj, dtype=np.uint8)
+
+    # 2. Apply Organ-Specific Post-Processing in (X, Y, Z) Space
     if apply_post:
-        # sitk.GetArrayFromImage returns numpy shape (Z, Y, X)
-        arr_zyx = sitk.GetArrayFromImage(pred_sitk).astype(np.uint8)
+        res_arr = post_process_3d(res_arr, num_classes=num_classes)
 
-        # Transpose to (Y, X, Z) or (H, W, Z) for post_process_3d
-        arr_hwz = np.transpose(arr_zyx, (1, 2, 0))
+    # 3. Save initial volume using preprocessed affine matrix & header
+    new_nib = nib.nifti1.Nifti1Image(
+        res_arr, affine=orig_nib.affine, header=orig_nib.header
+    )
+    nib.save(new_nib, str(out_nii_path))
 
-        cleaned_hwz = post_process_3d(arr_hwz, num_classes=num_classes)
+    # 4. Physical Resampling to Raw Scan Space
+    raw_ct_path = Path(raw_scan_pattern.format(id_=patient_id))
+    if not raw_ct_path.exists():
+        print(
+            f"[Warning] Raw CT scan reference not found: {raw_ct_path}. Skipping resampling."
+        )
+        return
 
-        # Transpose back to (Z, Y, X) for SimpleITK
-        cleaned_zyx = np.transpose(cleaned_hwz, (2, 0, 1))
-
-        cleaned_sitk = sitk.GetImageFromArray(cleaned_zyx)
-        cleaned_sitk.CopyInformation(pred_sitk)
-        pred_sitk = cleaned_sitk
-
-    # 4. Resample back to original Raw CT Reference Space
-    final_sitk = resample_to_raw_reference(pred_sitk, raw_ct_path)
-
-    # 5. Write final output NIfTI
-    out_patient_dir = output_dir / patient_id
-    out_patient_dir.mkdir(parents=True, exist_ok=True)
-    sitk.WriteImage(final_sitk, str(out_patient_dir / f"{patient_id}.nii.gz"))
+    # Resample from preprocessed physical space back to raw physical space
+    resample_mask_to_raw_ct(out_nii_path, raw_ct_path, out_nii_path)
 
 
 # ==============================================================================
-# MAIN ENTRY POINT
+# MAIN CLI ENTRYPOINT
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Universal post-processor and raw reference resampler for 2D & 3D predictions."
+        description="Universal post-processing and raw physical resampling pipeline."
     )
     parser.add_argument(
         "--pred_dir",
         type=Path,
         required=True,
-        help="Directory containing predictions (2D slice files or 3D NIfTI subfolders)",
+        help="Directory containing slice predictions (.png/.npy) or 3D NIfTIs",
     )
     parser.add_argument(
-        "--raw_dir",
+        "--preprocessed_scan_pattern",
+        type=str,
+        required=True,
+        help="Path pattern to preprocessed scan (e.g. 'data/preprocessed/{id_}.nii.gz')",
+    )
+    parser.add_argument(
+        "--raw_scan_pattern",
+        type=str,
+        required=True,
+        help="Path pattern to original raw CT scan (e.g. 'data/raw/{id_}.nii.gz')",
+    )
+    parser.add_argument(
+        "--dest_folder",
         type=Path,
         required=True,
-        help="Directory containing raw original CT volumes",
+        help="Output directory for saved .nii.gz volumes",
     )
     parser.add_argument(
-        "--output_dir",
-        type=Path,
-        required=True,
-        help="Output destination directory for resampled predictions",
-    )
-    parser.add_argument(
-        "--preprocessed_dir",
-        type=Path,
-        default=None,
-        help="Directory containing 3D preprocessed NIfTI files (Required if using 2D inputs)",
+        "--grp_regex",
+        type=str,
+        default=r"^(Patient_\d+)",
+        help="Regex pattern to extract patient IDs from slice filenames",
     )
     parser.add_argument(
         "--is_2d_input",
         action="store_true",
-        help="Set if predictions are 2D slice files (.npy / .png) that require stitching",
+        help="Flag indicating predictions are 2D slice files",
     )
     parser.add_argument(
         "--num_classes", type=int, default=5, help="Number of segmentation classes"
@@ -322,7 +314,7 @@ def main():
     parser.add_argument(
         "--post",
         action="store_true",
-        help="Enable organ-specific 3D morphological post-processing",
+        help="Enable 3D organ-specific post-processing",
     )
     parser.add_argument(
         "-p",
@@ -334,10 +326,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Discover unique Patient IDs
+    args.dest_folder.mkdir(parents=True, exist_ok=True)
+
     patient_ids = set()
     if args.is_2d_input:
-        regex = re.compile(r"^(Patient_\d+)")
+        regex = re.compile(args.grp_regex)
         for f in args.pred_dir.glob("*"):
             match = regex.match(f.name)
             if match:
@@ -355,9 +348,9 @@ def main():
     pfun = partial(
         process_patient,
         pred_dir=args.pred_dir,
-        raw_dir=args.raw_dir,
-        preprocessed_dir=args.preprocessed_dir,
-        output_dir=args.output_dir,
+        preprocessed_scan_pattern=args.preprocessed_scan_pattern,
+        raw_scan_pattern=args.raw_scan_pattern,
+        output_dir=args.dest_folder,
         num_classes=args.num_classes,
         apply_post=args.post,
         is_2d_input=args.is_2d_input,
@@ -371,7 +364,7 @@ def main():
         with Pool(processes=num_workers) as pool:
             list(tqdm(pool.imap(pfun, patient_list), total=len(patient_list)))
 
-    print(f">> Post-processing and raw resampling complete! Saved to {args.output_dir}")
+    print(f">> Pipeline complete! Restored volumes saved to {args.dest_folder}")
 
 
 if __name__ == "__main__":

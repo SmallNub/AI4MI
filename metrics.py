@@ -295,32 +295,25 @@ def _load_volume(path: Path) -> tuple[np.ndarray, tuple[float, float, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Batch compute 3D segmentation metrics across patients"
+        description="Batch compute 3D segmentation metrics across 3D NIfTI patient volumes"
     )
 
-    # Can scan either PNG slice directory OR stitched volumes directory directly
-    parser.add_argument(
-        "--data_folder",
-        type=Path,
-        required=True,
-        help="Path to 2D slices folder OR folder containing stitched NIfTI volumes",
-    )
     parser.add_argument(
         "--volumes_folder",
         type=Path,
-        default=None,
-        help="Path to folder with stitched .nii.gz files. If omitted, uses data_folder.",
+        required=True,
+        help="Path to folder containing 3D prediction .nii.gz files",
     )
     parser.add_argument(
         "--target_pattern",
         type=str,
         required=True,
-        help="Pattern for target NIfTI files using {id_} placeholder (e.g. 'data/segthor_part1/train/{id_}/GT.nii.gz')",
+        help="Pattern for ground truth NIfTI files using {id_} placeholder (e.g. 'data/GT/{id_}.nii.gz')",
     )
     parser.add_argument(
         "--grp_regex",
         type=str,
-        required=True,
+        default=r"^(Patient_\d+)",
         help="Regex pattern with a matching group for patient ID",
     )
     parser.add_argument(
@@ -355,38 +348,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    v_folder = args.volumes_folder if args.volumes_folder else args.data_folder
-
-    images: list[Path] = list(args.data_folder.glob("*.png"))
     grouping_regex: Pattern = re.compile(args.grp_regex)
+    nii_files = list(args.volumes_folder.glob("*.nii.gz"))
 
-    if images:
-        stems: list[str] = [p.stem for p in images]
-        matches: list[Match] = [grouping_regex.match(s) for s in stems if grouping_regex.match(s)]  # type: ignore
-        unique_patients: list[str] = sorted(list({match.group(1) for match in matches}))
-    else:
-        # Fallback: scan for NIfTI volumes matching grp_regex directly
-        nii_files = list(v_folder.glob("*.nii.gz"))
-        unique_patients = []
-        for p in nii_files:
-            match = grouping_regex.match(p.name.replace(".nii.gz", ""))
-            if match:
-                unique_patients.append(match.group(1))
-        unique_patients = sorted(list(set(unique_patients)))
+    unique_patients = []
+    for p in nii_files:
+        match = grouping_regex.match(p.name.replace(".nii.gz", ""))
+        if match:
+            unique_patients.append(match.group(1))
+    unique_patients = sorted(list(set(unique_patients)))
 
     if not unique_patients:
         raise FileNotFoundError(
-            f"No matching patients found in {args.data_folder} with regex '{args.grp_regex}'"
+            f"No matching 3D NIfTI volumes found in {args.volumes_folder} with regex '{args.grp_regex}'"
         )
 
-    print(
-        f"Found {len(unique_patients)} unique patients for evaluation: {unique_patients}"
-    )
+    print(f"Found {len(unique_patients)} unique patient volumes for evaluation.")
 
     records = []
-
     for patient_id in tqdm(unique_patients, desc="Evaluating Patients", unit="patient"):
-        pred_path = (v_folder / patient_id).with_suffix(".nii.gz")
+        pred_path = args.volumes_folder / f"{patient_id}.nii.gz"
         target_path = Path(args.target_pattern.format(id_=patient_id))
 
         if not pred_path.exists():
@@ -428,31 +409,17 @@ def main() -> None:
 
     df = pd.DataFrame(records)
 
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 1000)
-
-    print("\n" + "=" * 60)
-    print(" PER-PATIENT / CLASS RESULTS ")
-    print("=" * 60)
-    print(df.to_string(index=False))
-
-    summary = df.groupby("class").mean(numeric_only=True).reset_index()
     print("\n" + "=" * 60)
     print(" MEAN METRICS ACROSS ALL PATIENTS ")
     print("=" * 60)
+    summary = df.groupby("class").mean(numeric_only=True).reset_index()
     print(summary.to_string(index=False))
 
     if args.csv_out:
         args.csv_out.parent.mkdir(parents=True, exist_ok=True)
-
         summary_rows = summary.copy()
         summary_rows.insert(0, "patient", "MEAN")
-
-        combined = pd.concat(
-            [df, summary_rows],
-            ignore_index=True,
-        )
-
+        combined = pd.concat([df, summary_rows], ignore_index=True)
         combined.to_csv(args.csv_out, index=False)
         print(f"\nDetailed and mean metrics saved to {args.csv_out}")
 
