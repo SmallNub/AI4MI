@@ -17,10 +17,10 @@ source ai4mi/bin/activate
 
 export IS_SNELLIUS=1
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/segthor_processed
-python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
+# rm -rf data/segthor_processed
+# python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
 MODEL="imp3d50"
 

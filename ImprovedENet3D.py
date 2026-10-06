@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 
-from typing import Tuple, Union
+from typing import List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
 # =====================================================================
-# Channels-Last-3D Space-To-Depth & Depth-To-Space Modules
+# Space-To-Depth & Depth-To-Space Modules (Channels-Last-3D Compatible)
 # =====================================================================
 
 
 class SpaceToDepth3D(nn.Module):
     """Folds spatial voxels into channels with zero information loss.
 
-    Preserves `torch.channels_last_3d` memory format without memory re-allocations.
+    Preserves `torch.channels_last_3d` memory format.
     Input:  [B, C, D, H, W]
-    Output: [B, C * (block_size_d * block_size_h * block_size_w), D // block_size_d, H // block_size_h, W // block_size_w]
+    Output: [B, C * (bd * bh * bw), D // bd, H // bh, W // bw]
     """
 
     def __init__(self, block_size: Union[int, Tuple[int, int, int]] = (1, 2, 2)):
@@ -35,14 +35,9 @@ class SpaceToDepth3D(nn.Module):
             d % bd == 0 and h % bh == 0 and w % bw == 0
         ), f"Spatial dimensions ({d},{h},{w}) must be divisible by block_size={self.bs}"
 
-        # Unfold spatial dimensions into blocks
         x = x.view(b, c, d // bd, bd, h // bh, bh, w // bw, bw)
-        # Permute spatial blocks directly into channel dimensions
         x = x.permute(0, 1, 3, 5, 7, 2, 4, 6)
-        # Reshape back to 5D volume
         out = x.reshape(b, c * (bd * bh * bw), d // bd, h // bh, w // bw)
-
-        # Enforce channels_last_3d layout consistency
         return out.contiguous(memory_format=torch.channels_last_3d)
 
 
@@ -50,7 +45,7 @@ class DepthToSpace3D(nn.Module):
     """Exact spatial reconstruction inverse of SpaceToDepth3D.
 
     Input:  [B, C, D, H, W]
-    Output: [B, C // (block_size_d * block_size_h * block_size_w), D * block_size_d, H * block_size_h, W * block_size_w]
+    Output: [B, C // (bd * bh * bw), D * bd, H * bh, W * bw]
     """
 
     def __init__(self, block_size: Union[int, Tuple[int, int, int]] = (1, 2, 2)):
@@ -69,7 +64,6 @@ class DepthToSpace3D(nn.Module):
         x = x.view(b, out_c, bd, bh, bw, d, h, w)
         x = x.permute(0, 1, 5, 2, 6, 3, 7, 4)
         out = x.reshape(b, out_c, d * bd, h * bh, w * bw)
-
         return out.contiguous(memory_format=torch.channels_last_3d)
 
 
@@ -118,10 +112,11 @@ def model_weights_init(m: nn.Module) -> None:
             nn.init.zeros_(m.bias)
 
 
-class GRN3D(nn.Module):
-    """Global Response Normalization (ConvNeXt V2) for 3D tensors.
+class PatchStableGRN3D(nn.Module):
+    """Patch-invariant Global Response Normalization for 3D tensors.
 
-    Prevents feature redundancy across channels without adding parameters.
+    Calibrates channel features without spatial aggregation over patch boundaries,
+    preventing seam artifacts during sliding window inference.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -131,9 +126,8 @@ class GRN3D(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        # L2 norm across spatial dimensions (D, H, W)
-        gx = torch.norm(x, p=2, dim=(2, 3, 4), keepdim=True)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        # Channel-wise L2 norm per voxel location
+        nx = x / (torch.norm(x, p=2, dim=1, keepdim=True) + self.eps)
         return self.gamma * (x * nx) + self.beta + x
 
 
@@ -159,43 +153,48 @@ class FastSqueezeExcite3D(nn.Module):
 
 
 class FactorizedConvNeXtV2Block3D(nn.Module):
-    """3D ConvNeXt-V2 block featuring GRN, factorized depthwise convs, and 1.5x expand ratio."""
+    """3D ConvNeXt-V2 block featuring Patch-Stable GRN and anisotropic factorized depthwise convs."""
 
     def __init__(
         self,
         in_dim: int,
         out_dim: int,
-        kernel_size: int = 7,
+        kernel_size: Union[int, Tuple[int, int, int]] = (3, 7, 7),
         stride: Union[int, Tuple[int, int, int]] = 1,
         expand_ratio: float = 1.5,
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
-        p = kernel_size // 2
-        hidden_dim = int(in_dim * expand_ratio)
-
-        stride_s = (
-            (1, stride[1], stride[2])
-            if isinstance(stride, tuple)
-            else (1, stride, stride)
+        ks = (
+            kernel_size
+            if isinstance(kernel_size, tuple)
+            else (kernel_size, kernel_size, kernel_size)
         )
-        stride_d = (stride[0], 1, 1) if isinstance(stride, tuple) else (stride, 1, 1)
+        st = stride if isinstance(stride, tuple) else (stride, stride, stride)
+
+        pd = (ks[0] // 2, 0, 0)
+        ps = (0, ks[1] // 2, ks[2] // 2)
+
+        stride_s = (1, st[1], st[2])
+        stride_d = (st[0], 1, 1)
+
+        hidden_dim = int(in_dim * expand_ratio)
 
         self.dwconv_spatial = nn.Conv3d(
             in_dim,
             in_dim,
-            kernel_size=(1, kernel_size, kernel_size),
+            kernel_size=(1, ks[1], ks[2]),
             stride=stride_s,
-            padding=(0, p, p),
+            padding=ps,
             groups=in_dim,
             bias=False,
         )
         self.dwconv_depth = nn.Conv3d(
             in_dim,
             in_dim,
-            kernel_size=(kernel_size, 1, 1),
+            kernel_size=(ks[0], 1, 1),
             stride=stride_d,
-            padding=(p, 0, 0),
+            padding=pd,
             groups=in_dim,
             bias=False,
         )
@@ -203,7 +202,7 @@ class FactorizedConvNeXtV2Block3D(nn.Module):
         self.norm = get_group_norm_3d(in_dim)
         self.pwconv1 = nn.Conv3d(in_dim, hidden_dim, kernel_size=1, bias=False)
         self.act = nn.SiLU(inplace=True)
-        self.grn = GRN3D(hidden_dim)
+        self.grn = PatchStableGRN3D(hidden_dim)
         self.pwconv2 = nn.Conv3d(hidden_dim, out_dim, kernel_size=1, bias=False)
         self.se = FastSqueezeExcite3D(out_dim)
 
@@ -211,9 +210,9 @@ class FactorizedConvNeXtV2Block3D(nn.Module):
             DropPath3D(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
 
-        if stride != 1 or in_dim != out_dim:
+        if st != (1, 1, 1) or in_dim != out_dim:
             self.shortcut = nn.Sequential(
-                nn.Conv3d(in_dim, out_dim, kernel_size=1, stride=stride, bias=False),
+                nn.Conv3d(in_dim, out_dim, kernel_size=1, stride=st, bias=False),
                 get_group_norm_3d(out_dim),
             )
         else:
@@ -259,7 +258,7 @@ class EfficientUpDecoderBlock3D(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.spatial = FactorizedConvNeXtV2Block3D(
-            out_dim, out_dim, kernel_size=7, drop_path_rate=drop_path_rate
+            out_dim, out_dim, kernel_size=(3, 5, 5), drop_path_rate=drop_path_rate
         )
 
     def forward(self, x: Tensor, skip: Tensor) -> Tensor:
@@ -267,40 +266,38 @@ class EfficientUpDecoderBlock3D(nn.Module):
             x, size=skip.shape[2:], mode="trilinear", align_corners=False
         )
         skip_proj = self.proj_skip(skip)
-        # Channel-gated additive skip fusion
         fused = x_up + (skip_proj * self.gate(x_up))
         return self.spatial(self.reduce(fused))
 
 
 # =====================================================================
-# Main Architecture: ImprovedENet3D (With SpaceToDepth Stem & DepthToSpace Head)
+# Main Architecture: ImprovedENet3D (Patch & Sliding Window Optimized)
 # =====================================================================
 
 
 class ImprovedENet3D(nn.Module):
-    """Maximum-efficiency 3D UNet architecture with Channels-Last-3D SpaceToDepth Stem,
+    """Patch-optimized 3D UNet for SEGTHOR segmentation (32x128x128 input patches).
 
-    GRN, Dual Multi-Dilation Bottleneck, and DepthToSpace reconstruction head.
+    Features SpaceToDepth Stem, Anisotropic Downsampling, Patch-Stable GRN,
+    Anisotropic Bottleneck Dilations, and optional Deep Supervision.
     """
 
     def __init__(
         self,
         in_dim: int = 1,
-        out_dim: int = 1,
+        out_dim: int = 5,  # SEGTHOR: 0=BG, 1=Esophagus, 2=Heart, 3=Trachea, 4=Aorta
         drop_rate: float = 0.1,
         bottleneck_drop_rate: float = 0.2,
-        stem_block_size: Union[int, Tuple[int, int, int]] = (1, 2, 2),
+        stem_block_size: Tuple[int, int, int] = (1, 2, 2),
+        deep_supervision: bool = False,
         **kwargs,
     ):
         super().__init__()
         K: int = kwargs.get("kernels", 16)
-        self.stem_block_size = (
-            stem_block_size
-            if isinstance(stem_block_size, tuple)
-            else (stem_block_size, stem_block_size, stem_block_size)
-        )
+        self.stem_block_size = stem_block_size
+        self.deep_supervision = deep_supervision
 
-        # Zero-loss SpaceToDepth Stem (folds spatial voxels into channels)
+        # SpaceToDepth Stem (Input 32x128x128 -> Stem Output 32x64x64)
         bd, bh, bw = self.stem_block_size
         s2d_channels = in_dim * (bd * bh * bw)
 
@@ -309,38 +306,61 @@ class ImprovedENet3D(nn.Module):
         self.stem_norm = get_group_norm_3d(K)
         self.stem_act = nn.SiLU(inplace=True)
         self.stem_block = FactorizedConvNeXtV2Block3D(
-            K, K, kernel_size=3, drop_path_rate=0.0
+            K, K, kernel_size=(3, 3, 3), drop_path_rate=0.0
         )
 
-        # Encoders
+        # Encoders (Anisotropic strides to preserve depth resolution)
+        # enc1: (32,64,64) -> (32,32,32)
         self.enc1 = FactorizedConvNeXtV2Block3D(
-            K, K * 2, stride=2, drop_path_rate=drop_rate * 0.2
+            K,
+            K * 2,
+            stride=(1, 2, 2),
+            kernel_size=(3, 5, 5),
+            drop_path_rate=drop_rate * 0.2,
         )
+        # enc2: (32,32,32) -> (16,16,16)
         self.enc2 = nn.Sequential(
             FactorizedConvNeXtV2Block3D(
-                K * 2, K * 4, stride=2, drop_path_rate=drop_rate * 0.4
+                K * 2,
+                K * 4,
+                stride=(2, 2, 2),
+                kernel_size=(3, 5, 5),
+                drop_path_rate=drop_rate * 0.4,
             ),
             FactorizedConvNeXtV2Block3D(
-                K * 4, K * 4, stride=1, drop_path_rate=drop_rate * 0.4
+                K * 4,
+                K * 4,
+                stride=1,
+                kernel_size=(3, 5, 5),
+                drop_path_rate=drop_rate * 0.4,
             ),
         )
+        # enc3: (16,16,16) -> (8,8,8)
         self.enc3 = nn.Sequential(
             FactorizedConvNeXtV2Block3D(
-                K * 4, K * 8, stride=2, drop_path_rate=drop_rate * 0.6
+                K * 4,
+                K * 8,
+                stride=(2, 2, 2),
+                kernel_size=(3, 5, 5),
+                drop_path_rate=drop_rate * 0.6,
             ),
             FactorizedConvNeXtV2Block3D(
-                K * 8, K * 8, stride=1, drop_path_rate=drop_rate * 0.6
+                K * 8,
+                K * 8,
+                stride=1,
+                kernel_size=(3, 5, 5),
+                drop_path_rate=drop_rate * 0.6,
             ),
         )
 
-        # Bottleneck: Multi-Dilation Depthwise Cascade (d=1, 2, 4)
+        # Bottleneck: Anisotropic Dilated Depthwise Cascade (8x8x8 volume)
         self.bottleneck = nn.Sequential(
             nn.Conv3d(
                 K * 8,
                 K * 8,
                 kernel_size=3,
-                padding=1,
-                dilation=1,
+                padding=(1, 1, 1),
+                dilation=(1, 1, 1),
                 groups=K * 8,
                 bias=False,
             ),
@@ -348,8 +368,8 @@ class ImprovedENet3D(nn.Module):
                 K * 8,
                 K * 8,
                 kernel_size=3,
-                padding=2,
-                dilation=2,
+                padding=(1, 2, 2),
+                dilation=(1, 2, 2),
                 groups=K * 8,
                 bias=False,
             ),
@@ -357,15 +377,15 @@ class ImprovedENet3D(nn.Module):
                 K * 8,
                 K * 8,
                 kernel_size=3,
-                padding=4,
-                dilation=4,
+                padding=(2, 4, 4),
+                dilation=(2, 4, 4),
                 groups=K * 8,
                 bias=False,
             ),
             get_group_norm_3d(K * 8),
             nn.SiLU(inplace=True),
             FactorizedConvNeXtV2Block3D(
-                K * 8, K * 8, kernel_size=7, drop_path_rate=bottleneck_drop_rate
+                K * 8, K * 8, kernel_size=(3, 5, 5), drop_path_rate=bottleneck_drop_rate
             ),
         )
 
@@ -380,7 +400,7 @@ class ImprovedENet3D(nn.Module):
             in_dim=K * 2, skip_dim=K, out_dim=K, drop_path_rate=0.0
         )
 
-        # Final Reconstruction Head with DepthToSpace to restore full input spatial dimensions
+        # Final Head with DepthToSpace pixel unshuffle (Restores full 32x128x128 resolution)
         d2s_out_channels = out_dim * (bd * bh * bw)
         self.final_conv = nn.Sequential(
             nn.Conv3d(K, d2s_out_channels, kernel_size=1, bias=False),
@@ -389,28 +409,53 @@ class ImprovedENet3D(nn.Module):
         )
         self.d2s = DepthToSpace3D(block_size=self.stem_block_size)
 
+        # Optional Deep Supervision Heads
+        if self.deep_supervision:
+            self.ds_dec2 = nn.Conv3d(K * 2, out_dim, kernel_size=1)
+            self.ds_dec3 = nn.Conv3d(K * 4, out_dim, kernel_size=1)
+
         self.apply(model_weights_init)
 
-    def forward(self, input: Tensor) -> Tensor:
-        # SpaceToDepth stem downsamples spatial footprint instantly with 0 voxel loss
+    def forward(self, input: Tensor) -> Union[Tensor, Tuple[Tensor, List[Tensor]]]:
+        # Stem SpaceToDepth: (B, 1, 32, 128, 128) -> (B, K, 32, 64, 64)
         x0 = self.stem_s2d(input)
         x0 = self.stem_proj(x0)
         x0 = self.stem_norm(x0)
         x0 = self.stem_block(self.stem_act(x0))
 
-        x1 = self.enc1(x0)
-        x2 = self.enc2(x1)
-        x3 = self.enc3(x2)
+        # Encoders
+        x1 = self.enc1(x0)  # (B, K*2, 32, 32, 32)
+        x2 = self.enc2(x1)  # (B, K*4, 16, 16, 16)
+        x3 = self.enc3(x2)  # (B, K*8, 8, 8, 8)
 
-        b = self.bottleneck(x3)
+        # Bottleneck
+        b = self.bottleneck(x3)  # (B, K*8, 8, 8, 8)
 
-        d3 = self.dec3(b, x2)
-        d2 = self.dec2(d3, x1)
-        d1 = self.dec1(d2, x0)
+        # Decoders
+        d3 = self.dec3(b, x2)  # (B, K*4, 16, 16, 16)
+        d2 = self.dec2(d3, x1)  # (B, K*2, 32, 32, 32)
+        d1 = self.dec1(d2, x0)  # (B, K, 32, 64, 64)
 
-        # Final projection and DepthToSpace pixel unshuffle back to high-res input dimensions
+        # Final projection and DepthToSpace back to (B, out_dim, 32, 128, 128)
         out = self.final_conv(d1)
-        return self.d2s(out)
+        logits = self.d2s(out)
+
+        if self.training and self.deep_supervision:
+            ds2 = F.interpolate(
+                self.ds_dec2(d2),
+                size=input.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            ds3 = F.interpolate(
+                self.ds_dec3(d3),
+                size=input.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+            return logits, [ds2, ds3]
+
+        return logits
 
     def init_weights(self):
         self.apply(model_weights_init)

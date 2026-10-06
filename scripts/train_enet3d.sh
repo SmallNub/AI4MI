@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=train_imp
-#SBATCH --output=scripts/slurm/train_imp%j.log
-#SBATCH --error=scripts/slurm/train_imp%j.err
-#SBATCH --time=4:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --job-name=train_enet3d
+#SBATCH --output=scripts/slurm/train_enet3d%j.log
+#SBATCH --error=scripts/slurm/train_enet3d%j.err
+#SBATCH --time=1:00:00
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -22,29 +22,26 @@ export IS_SNELLIUS=1
 # rm -rf data/segthor_processed
 # python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
-# echo "Slicing..."
-
-# rm -rf data/SEGTHOR_processed
-# make data/SEGTHOR_processed
-
-MODEL="imp50"
+MODEL="enet3d"
 
 echo "Training..."
 
 python -O main.py \
-    --model ImprovedENet \
+    --model ENet3D \
     --loss compound \
     --use_focal \
-    --batch_size 32 \
+    --patch_size 32 128 128 \
+    --samples_per_volume 4 \
+    --val_batch_size 8 \
+    --batch_size 4 \
     --clip-grad 1.0 \
     --lr 0.001 \
     --epochs 50 \
     --warmup-epochs 3 \
-    --dataset SEGTHOR_processed \
+    --dataset segthor_processed \
     --dest results/segthor/$MODEL \
     --gpu \
     --channels_last \
-    --augment \
     --compile
 
 echo "Post Processing..."
@@ -55,14 +52,13 @@ python postprocess.py \
     --raw_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
     --dest_folder volumes/segthor/$MODEL \
     --grp_regex "^(Patient_\d+)" \
-    --is_2d_input \
     --num_classes 5 \
     -p 4
 
 echo "Computing Metrics..."
 
 python metrics.py \
-    --volumes_folder volumes/segthor/$MODEL \
+    --volumes_folder results/segthor/$MODEL/best_epoch \
     --target_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
     --grp_regex "(Patient_\d\d)" \
     --num_classes 5 \
