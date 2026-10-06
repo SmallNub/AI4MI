@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_imp3d
 #SBATCH --output=scripts/slurm/train_imp3d%j.log
 #SBATCH --error=scripts/slurm/train_imp3d%j.err
-#SBATCH --time=1:00:00
+#SBATCH --time=4:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
