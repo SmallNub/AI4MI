@@ -42,6 +42,7 @@ python -O main.py \
     --dataset segthor_processed \
     --dest results/segthor/$MODEL \
     --gpu \
+    --augment \
     --channels_last \
     --compile
 

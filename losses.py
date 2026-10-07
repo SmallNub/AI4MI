@@ -32,7 +32,8 @@ from torch import Tensor
 from utils import simplex, sset
 
 EPS = 1e-4
-DEFAULT_WEIGHTS = [0.2, 2.0, 1.0, 2.5, 1.2]
+# Adjusted default background weight from 0.2 to 0.5 to balance false positive penalty
+DEFAULT_WEIGHTS = [0.5, 2.0, 1.0, 2.5, 1.2]
 
 
 class CrossEntropy(nn.Module):
@@ -72,13 +73,14 @@ class CrossEntropy(nn.Module):
 
         self.register_buffer("target_weights", target_tensor)
 
-        # Initialize active weights to uniform 1.0 if rampup is enabled
         initial_weights = (
             torch.ones_like(target_tensor)
             if self.rampup_epochs > 0
             else target_tensor.clone()
         )
         self.register_buffer("weights", initial_weights)
+        self.register_buffer("ema_prec", None, persistent=False)
+        self.register_buffer("ema_rec", None, persistent=False)
         self.register_buffer("ema_val_dice", None, persistent=False)
 
         print(
@@ -111,9 +113,13 @@ class CrossEntropy(nn.Module):
         return current_weights
 
     def update_dynamic_class_weights(
-        self, val_dice_all_classes: Tensor, epoch: int
+        self,
+        val_dice_all_classes: Tensor,
+        val_prec_all_classes: Tensor | None = None,
+        val_rec_all_classes: Tensor | None = None,
+        epoch: int = 0,
     ) -> Tensor | None:
-        """Dynamically updates target weights based on EMA validation Dice scores."""
+        """Dynamically updates target weights based on Precision and Recall feedback."""
         if self.legacy:
             return None
 
@@ -121,22 +127,65 @@ class CrossEntropy(nn.Module):
             return self.update_scheduled_weights(epoch)
 
         device = self.weights.device
-        val_dice = val_dice_all_classes.detach().to(device)
 
-        if self.ema_val_dice is None:
-            self.ema_val_dice = val_dice.clone()
+        if val_prec_all_classes is not None and val_rec_all_classes is not None:
+            p = val_prec_all_classes.detach().to(device)
+            r = val_rec_all_classes.detach().to(device)
+
+            if self.ema_prec is None:
+                self.ema_prec = p.clone()
+                self.ema_rec = r.clone()
+            else:
+                self.ema_prec = (
+                    self.ema_decay * self.ema_prec + (1.0 - self.ema_decay) * p
+                )
+                self.ema_rec = (
+                    self.ema_decay * self.ema_rec + (1.0 - self.ema_decay) * r
+                )
+
+            new_target = self.target_weights.clone()
+            overseg_penalty = 0.0
+
+            # Foreground classes (indices 1 to K-1)
+            for c in range(1, len(self.target_weights)):
+                delta = self.ema_rec[c] - self.ema_prec[c]
+                if delta > 0.05:
+                    # Recall > Precision: Over-segmentation -> Reduce class weight
+                    new_target[c] -= 0.05 * delta
+                    overseg_penalty += delta
+                elif delta < -0.05:
+                    # Precision > Recall: Under-segmentation -> Increase class weight
+                    new_target[c] += 0.05 * abs(delta)
+
+                new_target[c] = torch.clamp(new_target[c], min=0.5, max=3.0)
+
+            # Adjust Background weight (index 0)
+            if overseg_penalty > 0:
+                avg_overseg = overseg_penalty / (len(self.target_weights) - 1)
+                new_target[0] += 0.05 * avg_overseg
+            else:
+                if new_target[0] > 0.5:
+                    new_target[0] -= 0.01
+
+            new_target[0] = torch.clamp(new_target[0], min=0.4, max=1.2)
+            self.target_weights.copy_(new_target)
         else:
-            self.ema_val_dice = (
-                self.ema_decay * self.ema_val_dice + (1.0 - self.ema_decay) * val_dice
+            val_dice = val_dice_all_classes.detach().to(device)
+            if self.ema_val_dice is None:
+                self.ema_val_dice = val_dice.clone()
+            else:
+                self.ema_val_dice = (
+                    self.ema_decay * self.ema_val_dice
+                    + (1.0 - self.ema_decay) * val_dice
+                )
+
+            raw_weights = torch.pow(1.0 - self.ema_val_dice, self.dynamic_power)
+            normalized_weights = raw_weights / torch.clamp(
+                torch.mean(raw_weights), min=self.eps
             )
+            clamped_weights = torch.clamp(normalized_weights, min=0.5, max=2.5)
+            self.target_weights.copy_(clamped_weights)
 
-        raw_weights = torch.pow(1.0 - self.ema_val_dice, self.dynamic_power)
-        normalized_weights = raw_weights / torch.clamp(
-            torch.mean(raw_weights), min=self.eps
-        )
-        clamped_weights = torch.clamp(normalized_weights, min=0.2, max=5.0)
-
-        self.target_weights.copy_(clamped_weights)
         return self.update_scheduled_weights(epoch)
 
     def forward(self, pred_softmax: Tensor, weak_target: Tensor) -> tuple[Tensor, list]:
@@ -162,7 +211,6 @@ class CrossEntropy(nn.Module):
             p_clamped = p.clamp(min=self.eps, max=1.0 - self.eps)
             log_p = p_clamped.log()
 
-            # Dynamic spatial dimensions for 2D (B, C, H, W) or 3D (B, C, D, H, W)
             sum_dims = (0,) + tuple(range(2, p.dim()))
 
             per_class_numerator = -(t * log_p).sum(dim=sum_dims)
@@ -218,11 +266,6 @@ class FocalLoss(CrossEntropy):
             return weighted_loss, []
 
 
-class PartialCrossEntropy(CrossEntropy):
-    def __init__(self, **kwargs):
-        super().__init__(idk=[1], **kwargs)
-
-
 class GeneralizedDice(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
@@ -274,11 +317,43 @@ class MacroDiceLoss(nn.Module):
         return loss, []
 
 
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss with tunable alpha (FP penalty) and beta (FN penalty).
+    alpha = 0.6, beta = 0.4 penalizes False Positives to boost Precision.
+    """
+
+    def __init__(self, alpha: float = 0.6, beta: float = 0.4, **kwargs):
+        super().__init__()
+        self.idk = kwargs["idk"]
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = EPS
+
+    def forward(self, pred_softmax: Tensor, weak_target: Tensor) -> tuple[Tensor, list]:
+        p = pred_softmax[:, self.idk, ...].float()
+        t = weak_target[:, self.idk, ...].float()
+
+        sum_dims = (0,) + tuple(range(2, p.dim()))
+
+        tp = torch.sum(p * t, dim=sum_dims)
+        fp = torch.sum(p * (1.0 - t), dim=sum_dims)
+        fn = torch.sum((1.0 - p) * t, dim=sum_dims)
+
+        tversky_per_class = (tp + self.eps) / (
+            tp + self.alpha * fp + self.beta * fn + self.eps
+        )
+        loss = 1.0 - tversky_per_class.mean()
+        return loss, []
+
+
 class CompoundLoss(nn.Module):
     def __init__(
         self,
         use_focal: bool = False,
         gamma: float = 1.5,
+        alpha: float = 0.6,
+        beta: float = 0.4,
         class_weights: list[float] = None,
         legacy: bool = False,
         ema_decay: float = 0.8,
@@ -308,27 +383,34 @@ class CompoundLoss(nn.Module):
         if self.legacy:
             self.gdl = GeneralizedDice(**kwargs)
         else:
-            self.gdl = MacroDiceLoss(**kwargs)
+            self.gdl = TverskyLoss(alpha=alpha, beta=beta, **kwargs)
 
         self.s_ce = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.s_gdl = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
         print(
-            f"Initialized {self.__class__.__name__} (use_focal={use_focal}, legacy={legacy})"
+            f"Initialized {self.__class__.__name__} (use_focal={use_focal}, legacy={legacy}, alpha={alpha}, beta={beta})"
         )
 
     def update_scheduled_weights(self, epoch: int) -> Tensor | None:
-        """Delegates curriculum ramp-up weight update to CE/Focal module."""
         if hasattr(self.ce, "update_scheduled_weights"):
             return self.ce.update_scheduled_weights(epoch)
         return None
 
     def update_dynamic_class_weights(
-        self, val_dice_all_classes: Tensor, epoch: int
+        self,
+        val_dice_all_classes: Tensor,
+        val_prec_all_classes: Tensor = None,
+        val_rec_all_classes: Tensor = None,
+        epoch: int = 0,
     ) -> Tensor | None:
-        """Delegates EMA weight update to CE/Focal module."""
         if hasattr(self.ce, "update_dynamic_class_weights"):
-            return self.ce.update_dynamic_class_weights(val_dice_all_classes, epoch)
+            return self.ce.update_dynamic_class_weights(
+                val_dice_all_classes,
+                val_prec_all_classes,
+                val_rec_all_classes,
+                epoch,
+            )
         return None
 
     def forward(

@@ -70,7 +70,7 @@ from utils import (
     seed_worker,
 )
 
-from losses import CrossEntropy, FocalLoss, GeneralizedDice, CompoundLoss
+from losses import CrossEntropy, FocalLoss, GeneralizedDice, CompoundLoss, TverskyLoss
 
 datasets_params: dict[str, dict[str, Any]] = {}
 datasets_params["TOY2"] = {"K": 2, "B": 2}
@@ -78,7 +78,6 @@ datasets_params["SEGTHOR"] = {"K": 5, "B": 8}
 datasets_params["SEGTHOR_processed"] = {"K": 5, "B": 8}
 datasets_params["segthor_train_full"] = {"K": 5, "B": 4}
 datasets_params["segthor_processed"] = {"K": 5, "B": 4}
-
 
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
@@ -136,6 +135,22 @@ optimizer_params["adam"] = {
 optimizer_params["sgd"] = {"optim": torch.optim.SGD, "args": {}}
 
 
+def precision_coef(p: Tensor, t: Tensor, eps: float = 1e-5) -> Tensor:
+    """Computes Precision per class: TP / (TP + FP)."""
+    sum_dims = tuple(range(2, p.dim()))
+    tp = (p * t).sum(dim=sum_dims)
+    pred_sum = p.sum(dim=sum_dims)
+    return (tp + eps) / (pred_sum + eps)
+
+
+def recall_coef(p: Tensor, t: Tensor, eps: float = 1e-5) -> Tensor:
+    """Computes Recall per class: TP / (TP + FN)."""
+    sum_dims = tuple(range(2, p.dim()))
+    tp = (p * t).sum(dim=sum_dims)
+    gt_sum = t.sum(dim=sum_dims)
+    return (tp + eps) / (gt_sum + eps)
+
+
 def img_transform(img):
     img = img[np.newaxis, ...]
     img = torch.tensor(img, dtype=torch.float32)
@@ -160,7 +175,6 @@ def sliding_window_inference(
     loss_fn: nn.Module | None = None,
     gt: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None, list[Tensor]]:
-    """Performs sliding window inference over full 3D volumes using sub-patches."""
     B, C, D, H, W = inputs.shape
 
     if patch_size is None:
@@ -272,8 +286,7 @@ def evaluate_val_patches(
     amp_enabled: bool,
     memory_format: torch.memory_format | None = None,
     val_batch_size: int = 8,
-) -> tuple[float, Tensor, list[Tensor]]:
-    """Evaluates validation loss and Dice on batched sub-patches on GPU."""
+) -> tuple[float, Tensor, Tensor, Tensor, list[Tensor]]:
     B, C, D, H, W = img.shape
     pD, pH, pW = patch_size
 
@@ -308,6 +321,8 @@ def evaluate_val_patches(
 
     patch_losses = []
     patch_dices = []
+    patch_precs = []
+    patch_recs = []
     patch_info_list = []
 
     for idx in range(0, len(patch_coords), val_batch_size):
@@ -338,15 +353,21 @@ def evaluate_val_patches(
 
         patch_seg = probs2one_hot(probs)
         p_dice = dice_coef(patch_seg, batch_gt)
+        p_prec = precision_coef(patch_seg, batch_gt)
+        p_rec = recall_coef(patch_seg, batch_gt)
 
         patch_losses.append(p_loss.detach().item())
         patch_dices.append(p_dice.detach().cpu())
+        patch_precs.append(p_prec.detach().cpu())
+        patch_recs.append(p_rec.detach().cpu())
+
         if p_info:
             patch_info_list.append([info.detach() for info in p_info])
 
     avg_loss = float(np.mean(patch_losses))
-    all_dices = torch.cat(patch_dices, dim=0)
-    avg_dice = all_dices.mean(dim=0, keepdim=True)
+    avg_dice = torch.cat(patch_dices, dim=0).mean(dim=0, keepdim=True)
+    avg_prec = torch.cat(patch_precs, dim=0).mean(dim=0, keepdim=True)
+    avg_rec = torch.cat(patch_recs, dim=0).mean(dim=0, keepdim=True)
 
     avg_info = []
     if patch_info_list:
@@ -355,7 +376,7 @@ def evaluate_val_patches(
             m_vals = torch.stack([p_info[m_idx] for p_info in patch_info_list])
             avg_info.append(m_vals.mean())
 
-    return avg_loss, avg_dice, avg_info
+    return avg_loss, avg_dice, avg_prec, avg_rec, avg_info
 
 
 def export_best_predictions(
@@ -367,7 +388,6 @@ def export_best_predictions(
     amp_enabled: bool,
     memory_format: torch.memory_format | None,
 ):
-    """Exports full 3D prediction volumes as NIfTI files upon training completion."""
     print("\n>> Training complete. Exporting full 3D predictions for best model...")
     best_weights_path = args.dest / "bestweights.pt"
     if not best_weights_path.exists():
@@ -594,7 +614,9 @@ def setup(
         raise ValueError(args.mode, args.dataset)
 
     loss_kwargs = {
-        "use_focal": args.use_focal if hasattr(args, "use_focal") else False,
+        "use_focal": getattr(args, "use_focal", False),
+        "alpha": getattr(args, "alpha", 0.6),
+        "beta": getattr(args, "beta", 0.4),
         "idk": supervised_ids,
         "device": device,
         "legacy": getattr(args, "legacy_loss", False),
@@ -621,6 +643,8 @@ def setup(
             loss_fn = CrossEntropy(**loss_kwargs).to(device)
     elif args.loss == "gdl":
         loss_fn = GeneralizedDice(**loss_kwargs).to(device)
+    elif args.loss == "tversky":
+        loss_fn = TverskyLoss(**loss_kwargs).to(device)
     elif args.loss == "compound":
         loss_fn = CompoundLoss(**loss_kwargs).to(device)
         loss_params = list(loss_fn.parameters())
@@ -742,11 +766,12 @@ def runTraining(args):
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
+    log_prec_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
+    log_rec_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
     best_dice: float = 0.0
 
     for e in range(args.epochs):
-        # Update class weight curriculum schedule at the start of epoch
         if hasattr(loss_fn, "update_scheduled_weights"):
             active_w = loss_fn.update_scheduled_weights(epoch=e)
             if active_w is not None and getattr(args, "rampup_epochs", 0) > 0:
@@ -797,7 +822,6 @@ def runTraining(args):
                             out = net(img)
                             if isinstance(out, tuple):
                                 pred_logits, aux_logits = out
-
                                 aux_probs = F.softmax(aux_logits, dim=1)
                                 loss_aux, *_ = loss_fn.aux_loss_fn(aux_probs, gt)
                             else:
@@ -848,24 +872,28 @@ def runTraining(args):
                         scaler.update()
 
                     else:
-                        # VALIDATION BRANCH
+                        # VALIDATION
                         B = img.shape[0]
                         if is_3d_model and patch_size:
-                            v_loss, v_dice, loss_info = evaluate_val_patches(
-                                net=net,
-                                img=img,
-                                gt=gt,
-                                patch_size=patch_size,
-                                overlap=args.val_overlap,
-                                loss_fn=loss_fn,
-                                device=device,
-                                amp_dtype=amp_dtype,
-                                amp_enabled=amp_enabled,
-                                memory_format=memory_format,
-                                val_batch_size=args.val_batch_size,
+                            v_loss, v_dice, v_prec, v_rec, loss_info = (
+                                evaluate_val_patches(
+                                    net=net,
+                                    img=img,
+                                    gt=gt,
+                                    patch_size=patch_size,
+                                    overlap=args.val_overlap,
+                                    loss_fn=loss_fn,
+                                    device=device,
+                                    amp_dtype=amp_dtype,
+                                    amp_enabled=amp_enabled,
+                                    memory_format=memory_format,
+                                    val_batch_size=args.val_batch_size,
+                                )
                             )
                             log_loss[e, i] = v_loss
                             log_dice[e, j : j + B, :] = v_dice
+                            log_prec_val[e, j : j + B, :] = v_prec
+                            log_rec_val[e, j : j + B, :] = v_rec
                         else:
                             if memory_format is not None:
                                 img = img.to(memory_format=memory_format)
@@ -885,6 +913,10 @@ def runTraining(args):
                             with torch.no_grad():
                                 pred_seg = probs2one_hot(pred_probs)
                                 log_dice[e, j : j + B, :] = dice_coef(pred_seg, gt)
+                                log_prec_val[e, j : j + B, :] = precision_coef(
+                                    pred_seg, gt
+                                )
+                                log_rec_val[e, j : j + B, :] = recall_coef(pred_seg, gt)
 
                             with warnings.catch_warnings():
                                 warnings.filterwarnings("ignore", category=UserWarning)
@@ -932,13 +964,19 @@ def runTraining(args):
                         }
                     tq_iter.set_postfix(postfix_dict)
 
-        # Dynamic class weighting update based on validation epoch results
+        # Dynamic weight update based on Precision and Recall feedback
         val_dice_per_class = log_dice_val[e].mean(dim=0)
+        val_prec_per_class = log_prec_val[e].mean(dim=0)
+        val_rec_per_class = log_rec_val[e].mean(dim=0)
+
         if getattr(args, "dynamic_weights", False) and hasattr(
             loss_fn, "update_dynamic_class_weights"
         ):
             updated_w = loss_fn.update_dynamic_class_weights(
-                val_dice_per_class, epoch=e
+                val_dice_per_class,
+                val_prec_per_class,
+                val_rec_per_class,
+                epoch=e,
             )
             if updated_w is not None and e >= getattr(args, "dynamic_warmup", 3):
                 print(
@@ -999,49 +1037,41 @@ def main():
     parser.add_argument(
         "--augment",
         action="store_true",
-        help="Enable data augmentations.",
     )
     parser.add_argument(
         "--drop_empty",
         action="store_true",
-        help="Drop slices with no target labels (1, 2, 3, 4) during training.",
     )
     parser.add_argument(
         "--batch_size",
         default=None,
         type=int,
-        help="Batch size (if not specified, uses dataset default).",
     )
     parser.add_argument(
         "--patch_size",
         nargs=3,
         default=None,
         type=int,
-        help="3D patch dimensions for patch-based training (e.g. 32 128 128).",
     )
     parser.add_argument(
         "--samples_per_volume",
         default=4,
         type=int,
-        help="Number of sub-volume patch samples drawn per 3D volume per epoch.",
     )
     parser.add_argument(
         "--overlap",
         default=0.5,
         type=float,
-        help="Overlap ratio for final sliding window inference export (0.0 to 1.0).",
     )
     parser.add_argument(
         "--val_overlap",
         default=0.0,
         type=float,
-        help="Overlap ratio during epoch validation (0.0 for fastest non-overlapping grid).",
     )
     parser.add_argument(
         "--val_batch_size",
         default=8,
         type=int,
-        help="Batch size for validation sub-patches evaluated on GPU.",
     )
     parser.add_argument("--model", default="ENet3D", choices=models_params.keys())
     parser.add_argument("--optim", default="adam", choices=optimizer_params.keys())
@@ -1054,51 +1084,56 @@ def main():
     parser.add_argument(
         "--loss",
         default="ce",
-        choices=["ce", "gdl", "compound"],
+        choices=["ce", "gdl", "tversky", "compound"],
     )
     parser.add_argument(
         "--use_focal",
         action="store_true",
     )
     parser.add_argument(
+        "--alpha",
+        default=0.6,
+        type=float,
+        help="Tversky Loss False Positive penalty multiplier (higher boosts precision).",
+    )
+    parser.add_argument(
+        "--beta",
+        default=0.4,
+        type=float,
+        help="Tversky Loss False Negative penalty multiplier.",
+    )
+    parser.add_argument(
         "--legacy_loss",
         action="store_true",
-        help="Use legacy loss functions (global sum CE/Focal & original GDL).",
     )
     parser.add_argument(
         "--rampup_epochs",
         default=5,
         type=int,
-        help="Number of epochs over which class weights ramp up from uniform (1:1) to target weights.",
     )
     parser.add_argument(
         "--rampup_schedule",
         default="linear",
         choices=["linear", "cosine"],
-        help="Interpolation schedule type for class weight annealing.",
     )
     parser.add_argument(
         "--dynamic_weights",
         action="store_true",
-        help="Enable dynamic class weighting based on validation Dice scores across training epochs.",
     )
     parser.add_argument(
         "--ema_decay",
         default=0.8,
         type=float,
-        help="Decay factor for Exponential Moving Average (EMA) of validation Dice metrics.",
     )
     parser.add_argument(
         "--dynamic_power",
         default=2.0,
         type=float,
-        help="Power exponent p for dynamic weight calculation (1 - Dice)^p.",
     )
     parser.add_argument(
         "--dynamic_warmup",
         default=3,
         type=int,
-        help="Number of initial warmup epochs before dynamic class weights start updating.",
     )
     parser.add_argument(
         "--clip-grad",
@@ -1111,13 +1146,11 @@ def main():
         type=Path,
         required=True,
     )
-
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument(
         "--fused",
         action="store_true",
         default=True,
-        help="Enable fused Adam optimizer on GPU.",
     )
     parser.add_argument(
         "--amp",
@@ -1127,7 +1160,6 @@ def main():
     parser.add_argument(
         "--channels_last",
         action="store_true",
-        help="Convert model weights and inputs to channels_last (NHWC/NDHWC) memory format.",
     )
     parser.add_argument(
         "--compile",
@@ -1161,7 +1193,6 @@ def main():
         nargs=3,
         default=[1.0, 1.0, 1.0],
         type=float,
-        help="Target spacing for resampling volumes (3 floats, e.g. 1.0 1.0 1.0).",
     )
 
     args = parser.parse_args()
