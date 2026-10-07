@@ -150,7 +150,7 @@ def gt_transform(K, img):
 
 def sliding_window_inference(
     inputs: Tensor,
-    patch_size: tuple[int, int, int],
+    patch_size: tuple[int, int, int] | None,
     overlap: float,
     net: nn.Module,
     device: torch.device,
@@ -162,6 +162,10 @@ def sliding_window_inference(
 ) -> tuple[Tensor, Tensor | None, list[Tensor]]:
     """Performs sliding window inference over full 3D volumes using sub-patches."""
     B, C, D, H, W = inputs.shape
+
+    if patch_size is None:
+        patch_size = (D, H, W)
+
     pD, pH, pW = patch_size
 
     pad_d = max(0, pD - D)
@@ -628,7 +632,11 @@ def setup(
                 **optim_kwargs,
             )
 
-    loss_fn.aux_loss_fn = CrossEntropy(**loss_kwargs) if isinstance(loss_fn, CompoundLoss) else loss_fn
+    loss_fn.aux_loss_fn = (
+        CrossEntropy(**loss_kwargs).to(device)
+        if isinstance(loss_fn, CompoundLoss)
+        else loss_fn
+    )
 
     warmup_epochs = getattr(args, "warmup_epochs", 3)
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
@@ -789,7 +797,7 @@ def runTraining(args):
                             out = net(img)
                             if isinstance(out, tuple):
                                 pred_logits, aux_logits = out
-                                
+
                                 aux_probs = F.softmax(aux_logits, dim=1)
                                 loss_aux, *_ = loss_fn.aux_loss_fn(aux_probs, gt)
                             else:
@@ -800,9 +808,17 @@ def runTraining(args):
                             loss_main, *loss_info = loss_fn(pred_probs, gt)
 
                             if is_3d_model:
-                                loss = loss_main + 0.1 * loss_aux if isinstance(out, tuple) else loss_main
+                                loss = (
+                                    loss_main + 0.1 * loss_aux
+                                    if isinstance(out, tuple)
+                                    else loss_main
+                                )
                             else:
-                                loss = loss_main + 0.4 * loss_aux if isinstance(out, tuple) else loss_main
+                                loss = (
+                                    loss_main + 0.4 * loss_aux
+                                    if isinstance(out, tuple)
+                                    else loss_main
+                                )
 
                         B = img.shape[0]
 
