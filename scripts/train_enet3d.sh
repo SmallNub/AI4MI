@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=train_vit
-#SBATCH --output=scripts/slurm/train_vit%j.log
-#SBATCH --error=scripts/slurm/train_vit%j.err
+#SBATCH --job-name=train_enet3d
+#SBATCH --output=scripts/slurm/train_enet3d%j.log
+#SBATCH --error=scripts/slurm/train_enet3d%j.err
 #SBATCH --time=4:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
@@ -17,34 +17,31 @@ source ai4mi/bin/activate
 
 export IS_SNELLIUS=1
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/segthor_processed
-python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
+# rm -rf data/segthor_processed
+# python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
-echo "Slicing..."
-
-rm -rf data/SEGTHOR_processed
-make data/SEGTHOR_processed
-
-MODEL="ViT"
+MODEL="enet3d"
 
 echo "Training..."
 
 python -O main.py \
-    --model ViT \
+    --model ENet3D \
     --loss compound \
     --use_focal \
-    --batch_size 32 \
+    --patch_size 32 128 128 \
+    --samples_per_volume 4 \
+    --val_batch_size 8 \
+    --batch_size 4 \
     --clip-grad 1.0 \
     --lr 0.001 \
     --epochs 50 \
     --warmup-epochs 3 \
-    --dataset SEGTHOR_processed \
+    --dataset segthor_processed \
     --dest results/segthor/$MODEL \
     --gpu \
     --channels_last \
-    --augment \
     --compile
 
 echo "Post Processing..."
@@ -56,7 +53,6 @@ python postprocess.py \
     --gt_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --dest_folder volumes/segthor/$MODEL \
     --grp_regex "^(Patient_\d+)" \
-    --is_2d_input \
     --num_classes 5 \
     --post \
     --evaluate_all_policies \
@@ -65,7 +61,7 @@ python postprocess.py \
 echo "Computing Metrics..."
 
 python metrics.py \
-    --volumes_folder volumes/segthor/$MODEL \
+    --volumes_folder results/segthor/$MODEL/best_epoch \
     --target_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
     --grp_regex "(Patient_\d\d)" \
     --num_classes 5 \

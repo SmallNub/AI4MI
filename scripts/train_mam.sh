@@ -2,8 +2,8 @@
 #SBATCH --job-name=train_mam
 #SBATCH --output=scripts/slurm/train_mam%j.log
 #SBATCH --error=scripts/slurm/train_mam%j.err
-#SBATCH --time=8:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --time=4:00:00
+#SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -17,15 +17,15 @@ source ai4mi/bin/activate
 
 export IS_SNELLIUS=1
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/segthor_processed
-python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
+# rm -rf data/segthor_processed
+# python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
-echo "Slicing..."
+# echo "Slicing..."
 
-rm -rf data/SEGTHOR_processed
-make data/SEGTHOR_processed
+# rm -rf data/SEGTHOR_processed
+# make data/SEGTHOR_processed
 
 MODEL="mam50"
 
@@ -53,10 +53,13 @@ python postprocess.py \
     --pred_dir results/segthor/$MODEL/best_epoch/val \
     --preprocessed_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --raw_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
+    --gt_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --dest_folder volumes/segthor/$MODEL \
     --grp_regex "^(Patient_\d+)" \
     --is_2d_input \
     --num_classes 5 \
+    --post \
+    --evaluate_all_policies \
     -p 4
 
 echo "Computing Metrics..."

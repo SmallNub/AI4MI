@@ -109,7 +109,7 @@ models_params["ViT"] = {
 }
 models_params["ImprovedENet3D"] = {
     "net": ImprovedENet3D,
-    "args": {"kernels": 4},
+    "args": {"kernels": 16},
 }
 models_params["MambaNet"] = {
     "net": MambaNet,

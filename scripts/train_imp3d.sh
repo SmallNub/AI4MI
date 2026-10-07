@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_imp3d
 #SBATCH --output=scripts/slurm/train_imp3d%j.log
 #SBATCH --error=scripts/slurm/train_imp3d%j.err
-#SBATCH --time=1:00:00
+#SBATCH --time=4:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -17,10 +17,10 @@ source ai4mi/bin/activate
 
 export IS_SNELLIUS=1
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/segthor_processed
-python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
+# rm -rf data/segthor_processed
+# python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
 MODEL="imp3d50"
 
@@ -50,9 +50,12 @@ python postprocess.py \
     --pred_dir results/segthor/$MODEL/best_epoch/val \
     --preprocessed_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --raw_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
+    --gt_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --dest_folder volumes/segthor/$MODEL \
     --grp_regex "^(Patient_\d+)" \
     --num_classes 5 \
+    --post \
+    --evaluate_all_policies \
     -p 4
 
 echo "Computing Metrics..."
