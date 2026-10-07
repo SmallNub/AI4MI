@@ -101,7 +101,7 @@ models_params["LateFusionENet"] = {
 }
 models_params["ImprovedENet"] = {
     "net": ImprovedENet,
-    "args": {"kernels": 16, "z_window": 15},
+    "args": {"kernels": 8, "z_window": 15},
 }
 models_params["ViT"] = {
     "net": ViT,
@@ -160,10 +160,7 @@ def sliding_window_inference(
     loss_fn: nn.Module | None = None,
     gt: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None, list[Tensor]]:
-    """Performs sliding window inference over full 3D volumes using sub-patches,
-
-    computes patch-wise loss on GPU, and reconstructs full volume on CPU to minimize VRAM usage.
-    """
+    """Performs sliding window inference over full 3D volumes using sub-patches."""
     B, C, D, H, W = inputs.shape
     pD, pH, pW = patch_size
 
@@ -336,7 +333,7 @@ def evaluate_val_patches(
             p_loss, *p_info = loss_fn(probs, batch_gt)
 
         patch_seg = probs2one_hot(probs)
-        p_dice = dice_coef(patch_seg, batch_gt)  # Shape: (batch_size_i, K)
+        p_dice = dice_coef(patch_seg, batch_gt)
 
         patch_losses.append(p_loss.detach().item())
         patch_dices.append(p_dice.detach().cpu())
@@ -344,10 +341,8 @@ def evaluate_val_patches(
             patch_info_list.append([info.detach() for info in p_info])
 
     avg_loss = float(np.mean(patch_losses))
-
-    # Concatenate all patch dice results along dim 0 to get (total_patches, K)
     all_dices = torch.cat(patch_dices, dim=0)
-    avg_dice = all_dices.mean(dim=0, keepdim=True)  # Shape: (1, K)
+    avg_dice = all_dices.mean(dim=0, keepdim=True)
 
     avg_info = []
     if patch_info_list:
@@ -368,14 +363,14 @@ def export_best_predictions(
     amp_enabled: bool,
     memory_format: torch.memory_format | None,
 ):
-    """Runs full 3D reconstruction ONLY ONCE at the end of training on the best weights and saves NIfTI files to disk."""
+    """Exports full 3D prediction volumes as NIfTI files upon training completion."""
     print("\n>> Training complete. Exporting full 3D predictions for best model...")
     best_weights_path = args.dest / "bestweights.pt"
     if not best_weights_path.exists():
         print(">> No best weights file found. Skipping export.")
         return
 
-    best_folder = args.dest / "best_epoch"
+    best_folder = args.dest / "best_epoch" / "val"
     best_folder.mkdir(parents=True, exist_ok=True)
 
     model_to_load = getattr(net, "_orig_mod", net)
@@ -598,6 +593,12 @@ def setup(
         "use_focal": args.use_focal if hasattr(args, "use_focal") else False,
         "idk": supervised_ids,
         "device": device,
+        "legacy": getattr(args, "legacy_loss", False),
+        "ema_decay": getattr(args, "ema_decay", 0.8),
+        "dynamic_power": getattr(args, "dynamic_power", 2.0),
+        "warmup_epochs": getattr(args, "dynamic_warmup", 3),
+        "rampup_epochs": getattr(args, "rampup_epochs", 5),
+        "schedule_type": getattr(args, "rampup_schedule", "linear"),
     }
 
     optim_kwargs = optimizer_params[args.optim]["args"].copy()
@@ -611,11 +612,11 @@ def setup(
     optimizer_loss = None
     if args.loss == "ce":
         if loss_kwargs["use_focal"]:
-            loss_fn = FocalLoss(**loss_kwargs)
+            loss_fn = FocalLoss(**loss_kwargs).to(device)
         else:
-            loss_fn = CrossEntropy(**loss_kwargs)
+            loss_fn = CrossEntropy(**loss_kwargs).to(device)
     elif args.loss == "gdl":
-        loss_fn = GeneralizedDice(**loss_kwargs)
+        loss_fn = GeneralizedDice(**loss_kwargs).to(device)
     elif args.loss == "compound":
         loss_fn = CompoundLoss(**loss_kwargs).to(device)
         loss_params = list(loss_fn.parameters())
@@ -728,12 +729,6 @@ def runTraining(args):
     print(f">> Mixed Precision (AMP): {args.amp.upper()} (Enabled: {amp_enabled})")
 
     patch_size = tuple(args.patch_size) if args.patch_size else None
-    if is_3d_model and patch_size:
-        print(f">> Patch-based Training Enabled in Dataset | Patch Size: {patch_size}")
-        print(f">> Samples per volume per epoch: {args.samples_per_volume}")
-        print(
-            f">> Fast Patch Validation Enabled | Overlap: {args.val_overlap} | Batch Size: {args.val_batch_size}"
-        )
 
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
@@ -743,6 +738,14 @@ def runTraining(args):
     best_dice: float = 0.0
 
     for e in range(args.epochs):
+        # Update class weight curriculum schedule at the start of epoch
+        if hasattr(loss_fn, "update_scheduled_weights"):
+            active_w = loss_fn.update_scheduled_weights(epoch=e)
+            if active_w is not None and getattr(args, "rampup_epochs", 0) > 0:
+                print(
+                    f">> Epoch {e:02d} Active Class Weights (Rampup): {active_w.cpu().numpy().round(3).tolist()}"
+                )
+
         for m in ["train", "val"]:
             match m:
                 case "train":
@@ -913,6 +916,19 @@ def runTraining(args):
                         }
                     tq_iter.set_postfix(postfix_dict)
 
+        # Dynamic class weighting update based on validation epoch results
+        val_dice_per_class = log_dice_val[e].mean(dim=0)
+        if getattr(args, "dynamic_weights", False) and hasattr(
+            loss_fn, "update_dynamic_class_weights"
+        ):
+            updated_w = loss_fn.update_dynamic_class_weights(
+                val_dice_per_class, epoch=e
+            )
+            if updated_w is not None and e >= getattr(args, "dynamic_warmup", 3):
+                print(
+                    f">> Updated Dynamic Class Weights for Epoch {e+1}: {updated_w.cpu().numpy().round(3).tolist()}"
+                )
+
         scheduler_net.step()
         if scheduler_loss:
             scheduler_loss.step()
@@ -1027,6 +1043,46 @@ def main():
     parser.add_argument(
         "--use_focal",
         action="store_true",
+    )
+    parser.add_argument(
+        "--legacy_loss",
+        action="store_true",
+        help="Use legacy loss functions (global sum CE/Focal & original GDL).",
+    )
+    parser.add_argument(
+        "--rampup_epochs",
+        default=5,
+        type=int,
+        help="Number of epochs over which class weights ramp up from uniform (1:1) to target weights.",
+    )
+    parser.add_argument(
+        "--rampup_schedule",
+        default="linear",
+        choices=["linear", "cosine"],
+        help="Interpolation schedule type for class weight annealing.",
+    )
+    parser.add_argument(
+        "--dynamic_weights",
+        action="store_true",
+        help="Enable dynamic class weighting based on validation Dice scores across training epochs.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        default=0.8,
+        type=float,
+        help="Decay factor for Exponential Moving Average (EMA) of validation Dice metrics.",
+    )
+    parser.add_argument(
+        "--dynamic_power",
+        default=2.0,
+        type=float,
+        help="Power exponent p for dynamic weight calculation (1 - Dice)^p.",
+    )
+    parser.add_argument(
+        "--dynamic_warmup",
+        default=3,
+        type=int,
+        help="Number of initial warmup epochs before dynamic class weights start updating.",
     )
     parser.add_argument(
         "--clip-grad",

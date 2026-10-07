@@ -30,6 +30,7 @@ python -O main.py \
     --model ENet3D \
     --loss compound \
     --use_focal \
+    --dynamic_weights \
     --patch_size 32 128 128 \
     --samples_per_volume 4 \
     --val_batch_size 8 \
@@ -61,7 +62,7 @@ python postprocess.py \
 echo "Computing Metrics..."
 
 python metrics.py \
-    --volumes_folder results/segthor/$MODEL/best_epoch \
+    --volumes_folder volumes/segthor/$MODEL \
     --target_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
     --grp_regex "(Patient_\d\d)" \
     --num_classes 5 \

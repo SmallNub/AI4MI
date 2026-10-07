@@ -30,6 +30,7 @@ python -O main.py \
     --model ImprovedENet3D \
     --loss compound \
     --use_focal \
+    --dynamic_weights \
     --patch_size 32 128 128 \
     --samples_per_volume 4 \
     --val_batch_size 8 \
