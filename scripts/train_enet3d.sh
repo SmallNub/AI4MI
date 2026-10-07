@@ -50,9 +50,12 @@ python postprocess.py \
     --pred_dir results/segthor/$MODEL/best_epoch/val \
     --preprocessed_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --raw_scan_pattern "data/segthor_train_full/train/{id_}/GT.nii.gz" \
+    --gt_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
     --dest_folder volumes/segthor/$MODEL \
     --grp_regex "^(Patient_\d+)" \
     --num_classes 5 \
+    --post \
+    --evaluate_all_policies \
     -p 4
 
 echo "Computing Metrics..."

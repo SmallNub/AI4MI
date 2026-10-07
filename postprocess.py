@@ -3,140 +3,452 @@
 Universal Post-Processing & Spatial Remapping Pipeline
 ------------------------------------------------------
 1. Stitches 2D slice predictions (.png / .npy) or reads 3D model predictions in preprocessed space.
-2. Applies organ-specific 3D post-processing in native (X, Y, Z) array space.
+2. If post-processing is enabled:
+   - Evaluates all candidate removal-only 3D post-processing policies against Ground Truth (if provided) using Mean Dice Score.
+   - Selects the best-performing policy and applies it.
 3. Maps predictions back to the preprocessed CT NIfTI header/affine.
 4. Resamples the segmentation back to the original raw CT physical space using SimpleITK.
 """
 
 import argparse
+import csv
+import json
 import re
 import shutil
 from collections import defaultdict
+from copy import deepcopy
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
 import SimpleITK as sitk
-from scipy.ndimage import (
-    binary_closing,
-    binary_fill_holes,
-    generate_binary_structure,
-    label,
-)
+from scipy import ndimage
 from skimage.io import imread
 from skimage.transform import resize
 from tqdm import tqdm
 
+# ==============================================================================
+# 1. ORGAN-SPECIFIC 3D POST-PROCESSING & POLICIES
+# ==============================================================================
 
-# ==============================================================================
-# 1. ORGAN-SPECIFIC 3D POST-PROCESSING (Native X, Y, Z Layout)
-# ==============================================================================
-def post_process_3d(
-    arr: np.ndarray,
-    num_classes: int = 5,
-    crop_z_margins: bool = False,
+LABELS = {1: "esophagus", 2: "heart", 3: "trachea", 4: "aorta"}
+POLICY_FIELDS = {
+    "enabled",
+    "connectivity",
+    "keep_largest",
+    "min_component_mm3",
+    "min_relative_to_largest",
+    "slice_lcc_axis",
+    "slice_connectivity",
+}
+
+# Base policy: no changes.
+BASE_POLICY: Dict[str, Dict[str, Any]] = {
+    str(label): {
+        "enabled": False,
+        "connectivity": 3,  # 1/2/3 means 6/18/26-neighbour 3D connectivity.
+        "keep_largest": False,
+        "min_component_mm3": 0.0,
+        "min_relative_to_largest": 0.0,
+        "slice_lcc_axis": None,
+        "slice_connectivity": 2,  # 1/2 means 4/8-neighbour connectivity in 2D.
+    }
+    for label in LABELS
+}
+
+
+def _with_overrides(
+    policy: Dict[str, Dict[str, Any]], **overrides: Any
+) -> Dict[str, Dict[str, Any]]:
+    """Return a copied policy with field overrides for selected labels."""
+    copied = deepcopy(policy)
+    for label, values in overrides.items():
+        copied[label].update(values)
+    return copied
+
+
+BUILTIN_POLICIES: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "none": deepcopy(BASE_POLICY),
+    "lcc_3d_non_esophagus": _with_overrides(
+        BASE_POLICY,
+        **{
+            "2": {"enabled": True, "keep_largest": True},
+            "3": {"enabled": True, "keep_largest": True},
+            "4": {"enabled": True, "keep_largest": True},
+        },
+    ),
+    "esophagus_min_500mm3": _with_overrides(
+        BASE_POLICY,
+        **{
+            "1": {
+                "enabled": True,
+                "min_component_mm3": 500.0,
+            }
+        },
+    ),
+    "heart_3d_lcc_axial_2d_lcc": _with_overrides(
+        BASE_POLICY,
+        **{
+            "2": {
+                "enabled": True,
+                "keep_largest": True,
+                "slice_lcc_axis": 2,
+                "slice_connectivity": 2,
+            }
+        },
+    ),
+    "relative_20pct_all": _with_overrides(
+        BASE_POLICY,
+        **{
+            str(label): {
+                "enabled": True,
+                "min_relative_to_largest": 0.2,
+            }
+            for label in LABELS
+        },
+    ),
+}
+
+
+def component_statistics(
+    mask: np.ndarray, connectivity: int
+) -> Tuple[np.ndarray, int, np.ndarray]:
+    """Label 3D components and return labels, count, and voxel counts."""
+    if mask.ndim != 3:
+        raise ValueError(f"Expected a 3D binary mask, got shape {mask.shape}")
+    if connectivity not in (1, 2, 3):
+        raise ValueError("3D connectivity must be 1, 2, or 3")
+
+    structure = ndimage.generate_binary_structure(3, connectivity)
+    labelled, n_components = ndimage.label(mask, structure=structure)
+    counts = np.bincount(labelled.ravel(), minlength=n_components + 1)
+    counts[0] = 0
+    return labelled, n_components, counts
+
+
+def retain_largest_component_per_slice(
+    mask: np.ndarray, axis: int, connectivity: int
 ) -> np.ndarray:
-    """
-    Organ-specific 3D post-processing tailored for axial CT volumes.
-    Iterates sequentially through class indices 1 to 4.
-    Input shape expected: (X, Y, Z) where Z is the axial slice index.
+    """Retain largest 2D component independently in each slice."""
+    if mask.ndim != 3:
+        raise ValueError(f"Expected a 3D binary mask, got shape {mask.shape}")
+    if axis not in (0, 1, 2):
+        raise ValueError("slice_lcc_axis must be 0, 1, 2, or null")
+    if connectivity not in (1, 2):
+        raise ValueError("slice_connectivity must be 1 or 2")
 
-    Classes:
-        1: Esophagus
-        2: Heart
-        3: Trachea
-        4: Aorta
-    """
-    cleaned_arr = np.zeros_like(arr, dtype=np.uint8)
-    struct_3d_26 = generate_binary_structure(3, 3)
-    struct_2d_8 = generate_binary_structure(2, 2)
+    moved = np.moveaxis(mask, axis, 0)
+    result = np.zeros_like(moved, dtype=bool)
+    structure = ndimage.generate_binary_structure(2, connectivity)
 
-    X, Y, Z = arr.shape
-    z_min, z_max = 0, Z
-    if crop_z_margins:
-        z_min = int(Z * 0.05)
-        z_max = int(Z * 0.95)
-
-    for c in range(1, num_classes):
-        mask = arr[:, :, z_min:z_max] == c
-        if not mask.any():
+    for index, slice_mask in enumerate(moved):
+        labelled, n_components = ndimage.label(slice_mask, structure=structure)
+        if n_components == 0:
             continue
+        counts = np.bincount(labelled.ravel(), minlength=n_components + 1)
+        counts[0] = 0
+        largest_id = int(np.argmax(counts))
+        result[index] = labelled == largest_id
 
-        # Class 1: Esophagus (Thin vertical structure across axial slices)
-        if c == 1:
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                valid_labels = np.where(sizes >= 250)[0]
-                if len(valid_labels) > 0:
-                    mask = np.isin(labeled_mask, valid_labels)
-                else:
-                    mask = labeled_mask == np.argmax(sizes)
+    return np.moveaxis(result, 0, axis)
 
-            z_gap_kernel = np.zeros((1, 1, 5), dtype=bool)
-            z_gap_kernel[0, 0, :] = True
-            mask = binary_closing(mask, structure=z_gap_kernel)
 
-        # Class 2: Heart (Large compact structure)
-        elif c == 2:
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
+def validate_policy(policy_by_label: Dict[str, Dict[str, Any]]) -> None:
+    """Reject malformed policy values before any prediction volume is modified."""
+    if set(policy_by_label) != set(BASE_POLICY):
+        raise ValueError("policy must define exactly labels '1', '2', '3' and '4'")
 
-            mask = binary_closing(mask, structure=struct_3d_26, iterations=2)
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                mask = labeled_mask == np.argmax(sizes)
+    for label, policy in policy_by_label.items():
+        unknown = set(policy) - POLICY_FIELDS
+        if unknown:
+            raise ValueError(f"unknown policy fields for label {label}: {sorted(unknown)}")
+        if int(policy["connectivity"]) not in (1, 2, 3):
+            raise ValueError(f"Label {label}: connectivity must be 1, 2 or 3")
+        if int(policy["slice_connectivity"]) not in (1, 2):
+            raise ValueError(f"Label {label}: slice_connectivity must be 1 or 2")
+        axis = policy["slice_lcc_axis"]
+        if axis is not None and int(axis) not in (0, 1, 2):
+            raise ValueError(f"Label {label}: slice_lcc_axis must be 0, 1, 2 or null")
+        if float(policy["min_component_mm3"]) < 0:
+            raise ValueError(f"Label {label}: min_component_mm3 must be non-negative")
+        relative = float(policy["min_relative_to_largest"])
+        if not 0.0 <= relative <= 1.0:
+            raise ValueError(
+                f"Label {label}: min_relative_to_largest must be between 0 and 1"
+            )
 
-        # Class 3: Trachea (Continuous central airway)
-        elif c == 3:
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
 
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                mask = labeled_mask == np.argmax(sizes)
+def apply_policy(
+    mask: np.ndarray,
+    spacing: Tuple[float, float, float],
+    policy: Dict[str, Any],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Apply one policy to a class mask."""
+    connectivity = int(policy["connectivity"])
+    labelled, n_before, counts_before = component_statistics(mask, connectivity)
+    voxel_volume_mm3 = float(np.prod(spacing))
+    input_voxels = int(mask.sum())
 
-            z_kernel = np.zeros((1, 1, 3), dtype=bool)
-            z_kernel[0, 0, :] = True
-            mask = binary_closing(mask, structure=z_kernel)
+    report: Dict[str, Any] = {
+        "components_before": n_before,
+        "largest_component_mm3_before": (
+            float(counts_before.max() * voxel_volume_mm3) if n_before else 0.0
+        ),
+        "input_voxels": input_voxels,
+        "removed_by_3d_filter_voxels": 0,
+        "removed_by_slice_lcc_voxels": 0,
+        "slice_lcc_axis": policy["slice_lcc_axis"],
+    }
 
-        # Class 4: Aorta (Ascending/Descending tubular sections)
-        elif c == 4:
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    slice_2d = binary_closing(
-                        mask[:, :, z], structure=struct_2d_8, iterations=1
-                    )
-                    mask[:, :, z] = binary_fill_holes(slice_2d)
+    if not bool(policy["enabled"]):
+        report.update(
+            {
+                "components_after": n_before,
+                "output_voxels": input_voxels,
+                "removed_voxels": 0,
+                "added_voxels": 0,
+            }
+        )
+        return mask.copy(), report
 
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                valid_labels = np.where(sizes >= 1500)[0]
-                if len(valid_labels) > 0:
-                    mask = np.isin(labeled_mask, valid_labels)
-                else:
-                    mask = labeled_mask == np.argmax(sizes)
+    keep_ids = np.arange(1, n_before + 1, dtype=np.int32)
 
-        empty_space = cleaned_arr[:, :, z_min:z_max] == 0
-        cleaned_arr[:, :, z_min:z_max][mask & empty_space] = c
+    if n_before and bool(policy["keep_largest"]):
+        keep_ids = np.array([int(np.argmax(counts_before))], dtype=np.int32)
 
-    return cleaned_arr
+    min_component_mm3 = float(policy["min_component_mm3"])
+    if n_before and min_component_mm3 > 0:
+        component_volumes_mm3 = counts_before * voxel_volume_mm3
+        absolute_ids = np.flatnonzero(component_volumes_mm3 >= min_component_mm3)
+        absolute_ids = absolute_ids[absolute_ids != 0]
+        keep_ids = np.intersect1d(keep_ids, absolute_ids)
+
+    min_relative = float(policy["min_relative_to_largest"])
+    if n_before and min_relative > 0:
+        relative_ids = np.flatnonzero(
+            counts_before >= min_relative * counts_before.max()
+        )
+        relative_ids = relative_ids[relative_ids != 0]
+        keep_ids = np.intersect1d(keep_ids, relative_ids)
+
+    cleaned = np.isin(labelled, keep_ids)
+    report["removed_by_3d_filter_voxels"] = int(
+        np.logical_and(mask, ~cleaned).sum()
+    )
+
+    slice_axis = policy["slice_lcc_axis"]
+    if slice_axis is not None:
+        before_slice_lcc = cleaned.copy()
+        cleaned = retain_largest_component_per_slice(
+            cleaned,
+            axis=int(slice_axis),
+            connectivity=int(policy["slice_connectivity"]),
+        )
+        report["removed_by_slice_lcc_voxels"] = int(
+            np.logical_and(before_slice_lcc, ~cleaned).sum()
+        )
+
+    if np.any(cleaned & ~mask):
+        raise RuntimeError("Internal error: a removal-only policy added voxels")
+
+    _, n_after, _ = component_statistics(cleaned, connectivity)
+    output_voxels = int(cleaned.sum())
+    report.update(
+        {
+            "components_after": n_after,
+            "output_voxels": output_voxels,
+            "removed_voxels": input_voxels - output_voxels,
+            "added_voxels": 0,
+        }
+    )
+    return cleaned.astype(bool), report
+
+
+def postprocess_volume(
+    labels: np.ndarray,
+    spacing: Tuple[float, float, float],
+    policy_by_label: Dict[str, Dict[str, Any]],
+    label_order: List[int],
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """Apply per-class policies to a 3D label map."""
+    if labels.ndim != 3:
+        raise ValueError(f"Expected one 3D label map, got shape {labels.shape}")
+
+    unique = set(np.unique(labels).astype(int))
+    allowed = {0, *LABELS}
+    if not unique.issubset(allowed):
+        raise ValueError(f"Expected labels {sorted(allowed)}, found {sorted(unique)}")
+    if sorted(label_order) != sorted(LABELS):
+        raise ValueError("label_order must contain labels 1, 2, 3, and 4 exactly once")
+
+    validate_policy(policy_by_label)
+    source = labels.astype(np.uint8, copy=True)
+    output = source.copy()
+    records: List[Dict[str, Any]] = []
+
+    for class_id in label_order:
+        original_mask = source == class_id
+        cleaned_mask, report = apply_policy(
+            original_mask,
+            spacing,
+            policy_by_label[str(class_id)],
+        )
+
+        output[original_mask & ~cleaned_mask] = 0
+
+        records.append(
+            {
+                "class": class_id,
+                "organ": LABELS[class_id],
+                "enabled": bool(policy_by_label[str(class_id)]["enabled"]),
+                "keep_largest": bool(policy_by_label[str(class_id)]["keep_largest"]),
+                "min_component_mm3": float(
+                    policy_by_label[str(class_id)]["min_component_mm3"]
+                ),
+                "min_relative_to_largest": float(
+                    policy_by_label[str(class_id)]["min_relative_to_largest"]
+                ),
+                **report,
+            }
+        )
+
+    return output, records
+
+
+def load_policy(
+    preset: str, config_path: Optional[Path] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Load policy preset and apply optional JSON config overrides."""
+    if preset not in BUILTIN_POLICIES:
+        raise ValueError(
+            f"Unknown preset {preset!r}; choose from {sorted(BUILTIN_POLICIES)}"
+        )
+
+    policy = deepcopy(BUILTIN_POLICIES[preset])
+    if config_path is None:
+        validate_policy(policy)
+        return policy
+
+    with config_path.open() as file:
+        supplied = json.load(file)
+    if not isinstance(supplied, dict):
+        raise ValueError("Configuration must be a JSON object keyed by label strings")
+
+    for label, overrides in supplied.items():
+        if label not in policy:
+            raise ValueError(f"Unknown label {label!r}; use strings '1' through '4'")
+        if not isinstance(overrides, dict):
+            raise ValueError(f"Policy for label {label} must be a JSON object")
+        unknown = set(overrides) - POLICY_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown fields for label {label}: {sorted(unknown)}")
+        policy[label].update(overrides)
+
+    validate_policy(policy)
+    return policy
 
 
 # ==============================================================================
-# 2. HELPER FUNCTIONS
+# 2. EVALUATION METRICS
+# ==============================================================================
+def compute_dice_score(
+    pred: np.ndarray, gt: np.ndarray, labels: List[int] = [1, 2, 3, 4]
+) -> Dict[int, float]:
+    """Compute per-class Dice coefficient between predicted and ground truth masks."""
+    dice_scores = {}
+    for c in labels:
+        p_mask = pred == c
+        g_mask = gt == c
+        intersection = np.logical_and(p_mask, g_mask).sum()
+        total_voxels = p_mask.sum() + g_mask.sum()
+        if total_voxels == 0:
+            dice_scores[c] = 1.0
+        else:
+            dice_scores[c] = float((2.0 * intersection) / total_voxels)
+    return dice_scores
+
+
+def evaluate_policies(
+    labels: np.ndarray,
+    spacing: Tuple[float, float, float],
+    gt_labels: Optional[np.ndarray] = None,
+    candidate_presets: Optional[List[str]] = None,
+    label_order: Optional[List[int]] = None,
+) -> Tuple[np.ndarray, str, float, Dict[str, Any]]:
+    """Loop through candidate post-processing policies and evaluate each method.
+
+    If ground truth is provided, evaluates methods using Mean Dice Score and
+    selects the best-performing policy.
+    If ground truth is not provided, defaults to comparing connectivity and
+    noise reduction metrics to pick the safest filtering configuration.
+    """
+    if candidate_presets is None:
+        candidate_presets = list(BUILTIN_POLICIES.keys())
+    if label_order is None:
+        label_order = [1, 2, 3, 4]
+
+    best_preset = candidate_presets[0]
+    best_score = -1.0
+    best_processed_arr = labels.copy()
+    best_records: Dict[str, Any] = {}
+
+    eval_results = []
+
+    for preset_name in candidate_presets:
+        policy = load_policy(preset_name)
+        processed_arr, records = postprocess_volume(
+            labels=labels,
+            spacing=spacing,
+            policy_by_label=policy,
+            label_order=label_order,
+        )
+
+        if gt_labels is not None:
+            # Evaluation with Ground Truth via Mean Dice Score
+            dice_dict = compute_dice_score(processed_arr, gt_labels, labels=label_order)
+            mean_dice = float(np.mean(list(dice_dict.values())))
+            score = mean_dice
+            eval_results.append(
+                {
+                    "preset": preset_name,
+                    "mean_dice": mean_dice,
+                    "per_class_dice": dice_dict,
+                }
+            )
+        else:
+            # Evaluation without Ground Truth (e.g., component count & noise filtering ratio)
+            total_removed = sum(r.get("removed_voxels", 0) for r in records)
+            total_input = sum(r.get("input_voxels", 1) for r in records) or 1
+            removal_ratio = total_removed / total_input
+            # Score penalizes over-removal (>15% voxels) while favoring artifact removal
+            score = 1.0 - abs(removal_ratio - 0.02)
+            eval_results.append(
+                {
+                    "preset": preset_name,
+                    "removal_ratio": removal_ratio,
+                    "score": score,
+                }
+            )
+
+        if score > best_score:
+            best_score = score
+            best_preset = preset_name
+            best_processed_arr = processed_arr
+            best_records = {
+                "preset": preset_name,
+                "score": score,
+                "records": records,
+                "all_evaluations": eval_results,
+            }
+
+    return best_processed_arr, best_preset, best_score, best_records
+
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
 # ==============================================================================
 def get_z_index(filepath: Path) -> int:
     """Extracts axial slice integer z-index from file name."""
@@ -149,8 +461,8 @@ def get_z_index(filepath: Path) -> int:
 def resample_mask_to_raw_ct(
     segmented_nii_path: Path, raw_ct_path: Path, output_path: Path
 ):
-    """
-    Resamples a 3D segmentation volume in preprocessed physical space back
+    """Resamples a 3D segmentation volume in preprocessed physical space back
+
     to match the original raw CT physical spatial resolution, origin, and bounds.
     """
     seg_sitk = sitk.ReadImage(str(segmented_nii_path))
@@ -166,7 +478,7 @@ def resample_mask_to_raw_ct(
 
 
 # ==============================================================================
-# 3. 2D & 3D PATIENT MERGING PIPELINE
+# 4. 2D & 3D PATIENT MERGING PIPELINE
 # ==============================================================================
 def process_patient(
     patient_id: str,
@@ -174,9 +486,14 @@ def process_patient(
     preprocessed_scan_pattern: str,
     raw_scan_pattern: str,
     output_dir: Path,
+    gt_scan_pattern: Optional[str] = None,
     num_classes: int = 5,
     apply_post: bool = True,
     is_2d_input: bool = True,
+    preset: str = "lcc_3d_non_esophagus",
+    config_path: Optional[Path] = None,
+    label_order: Optional[List[int]] = None,
+    evaluate_all: bool = False,
 ) -> None:
     # 1. Load Preprocessed Reference Volume (X, Y, Z) via Nibabel
     prep_nii_path = Path(preprocessed_scan_pattern.format(id_=patient_id))
@@ -244,9 +561,44 @@ def process_patient(
         pred_nib = nib.load(str(pred_3d_path))
         res_arr = np.asarray(pred_nib.dataobj, dtype=np.uint8)
 
-    # 2. Apply Organ-Specific Post-Processing in (X, Y, Z) Space
+    # 2. Evaluate & Apply Post-Processing Policies
     if apply_post:
-        res_arr = post_process_3d(res_arr, num_classes=num_classes)
+        spacing = tuple(float(v) for v in orig_nib.header.get_zooms()[:3])
+
+        # Load GT if path pattern provided and exists
+        gt_arr = None
+        if gt_scan_pattern:
+            gt_path = Path(gt_scan_pattern.format(id_=patient_id))
+            if gt_path.exists():
+                gt_nib = nib.load(str(gt_path))
+                gt_arr = np.asarray(gt_nib.dataobj, dtype=np.uint8)
+
+        if evaluate_all or gt_arr is not None:
+            # Loop through all built-in policies and pick the best method
+            res_arr, selected_preset, best_score, _ = evaluate_policies(
+                labels=res_arr,
+                spacing=spacing,
+                gt_labels=gt_arr,
+                candidate_presets=list(BUILTIN_POLICIES.keys()),
+                label_order=label_order or [1, 2, 3, 4],
+            )
+            score_msg = (
+                f"Mean Dice: {best_score:.4f}"
+                if gt_arr is not None
+                else f"Score: {best_score:.4f}"
+            )
+            print(
+                f"[{patient_id}] Selected best post-processing policy: '{selected_preset}' ({score_msg})"
+            )
+        else:
+            # Apply single specified preset
+            policy = load_policy(preset, config_path)
+            res_arr, _ = postprocess_volume(
+                labels=res_arr,
+                spacing=spacing,
+                policy_by_label=policy,
+                label_order=label_order or [1, 2, 3, 4],
+            )
 
     # 3. Save initial volume using preprocessed affine matrix & header
     new_nib = nib.nifti1.Nifti1Image(
@@ -292,6 +644,12 @@ def main():
         help="Path pattern to original raw CT scan (e.g. 'data/raw/{id_}.nii.gz')",
     )
     parser.add_argument(
+        "--gt_scan_pattern",
+        type=str,
+        default=None,
+        help="Optional path pattern to Ground Truth NIfTI scans for evaluating post-processing policies (e.g. 'data/gt/{id_}.nii.gz')",
+    )
+    parser.add_argument(
         "--dest_folder",
         type=Path,
         required=True,
@@ -315,6 +673,30 @@ def main():
         "--post",
         action="store_true",
         help="Enable 3D organ-specific post-processing",
+    )
+    parser.add_argument(
+        "--evaluate_all_policies",
+        action="store_true",
+        help="Loop through all post-processing policies, evaluate each, and select the best method",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=sorted(BUILTIN_POLICIES),
+        default="lcc_3d_non_esophagus",
+        help="Named policy preset for 3D post-processing when not evaluating all policies.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional JSON file for custom policy overrides.",
+    )
+    parser.add_argument(
+        "--label_order",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3, 4],
+        help="Class processing order; must contain labels 1, 2, 3 and 4 once each.",
     )
     parser.add_argument(
         "-p",
@@ -350,10 +732,15 @@ def main():
         pred_dir=args.pred_dir,
         preprocessed_scan_pattern=args.preprocessed_scan_pattern,
         raw_scan_pattern=args.raw_scan_pattern,
+        gt_scan_pattern=args.gt_scan_pattern,
         output_dir=args.dest_folder,
         num_classes=args.num_classes,
         apply_post=args.post,
         is_2d_input=args.is_2d_input,
+        preset=args.preset,
+        config_path=args.config,
+        label_order=args.label_order,
+        evaluate_all=args.evaluate_all_policies,
     )
 
     if args.process == 1:
@@ -364,7 +751,7 @@ def main():
         with Pool(processes=num_workers) as pool:
             list(tqdm(pool.imap(pfun, patient_list), total=len(patient_list)))
 
-    print(f">> Pipeline complete! Restored volumes saved to {args.dest_folder}")
+    print(f">> Pipeline complete! Saved volumes to {args.dest_folder}")
 
 
 if __name__ == "__main__":
