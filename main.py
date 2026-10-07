@@ -627,6 +627,8 @@ def setup(
                 **optim_kwargs,
             )
 
+    loss_fn.aux_loss_fn = CrossEntropy(**loss_kwargs) if isinstance(loss_fn, CompoundLoss) else loss_fn
+
     warmup_epochs = getattr(args, "warmup_epochs", 3)
     scheduler_net = build_scheduler(optimizer_net, warmup_epochs, args.epochs)
 
@@ -784,8 +786,9 @@ def runTraining(args):
                             out = net(img)
                             if isinstance(out, tuple):
                                 pred_logits, aux_logits = out
-                                aux_probs = F.softmax(1 * aux_logits, dim=1)
-                                loss_aux, *_ = loss_fn(aux_probs, gt)
+                                
+                                aux_probs = F.softmax(aux_logits, dim=1)
+                                loss_aux, *_ = loss_fn.aux_loss_fn(aux_probs, gt)
                             else:
                                 pred_logits = out
                                 loss_aux = 0.0
@@ -793,11 +796,10 @@ def runTraining(args):
                             pred_probs = F.softmax(1 * pred_logits, dim=1)
                             loss_main, *loss_info = loss_fn(pred_probs, gt)
 
-                            loss = (
-                                loss_main + 0.4 * loss_aux
-                                if isinstance(out, tuple)
-                                else loss_main
-                            )
+                            if is_3d_model:
+                                loss = loss_main + 0.1 * loss_aux if isinstance(out, tuple) else loss_main
+                            else:
+                                loss = loss_main + 0.4 * loss_aux if isinstance(out, tuple) else loss_main
 
                         B = img.shape[0]
 
