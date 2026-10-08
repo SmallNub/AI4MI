@@ -24,11 +24,10 @@
 
 import random
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import nibabel as nib
 import SimpleITK as sitk
 from torch.utils.data import Dataset
@@ -237,8 +236,6 @@ class SliceDataset(Dataset):
         z_window: int = 1,
         drop_empty: bool = False,
         resample: bool = False,
-        patch_size: Optional[Tuple[int, int, int]] = None,
-        samples_per_volume: int = 4,
     ):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
@@ -342,8 +339,6 @@ class Segthor3DDataset(Dataset):
         z_window: int = 1,
         resample: bool = False,
         target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        patch_size: Optional[Tuple[int, int, int]] = None,
-        samples_per_volume: int = 4,
     ):
         assert subset in ["train", "val", "test"]
 
@@ -356,8 +351,6 @@ class Segthor3DDataset(Dataset):
         self.shape = (128, 256, 256)
         self.resample = resample
         self.target_spacing = target_spacing
-        self.patch_size = tuple(patch_size) if patch_size is not None else None
-        self.samples_per_volume = max(1, samples_per_volume)
 
         raw_folder = "test" if self.test_mode else "train"
         self.data_path = self.root_dir / raw_folder
@@ -396,73 +389,15 @@ class Segthor3DDataset(Dataset):
             self.augmentor = None
 
         print(
-            f">> Created 3D {subset} dataset with {len(self.files)} base volumes "
-            f"(Total samples: {len(self)}, Augmentation: {self.augmentor is not None}, "
-            f"Resampling: {self.resample}, Patch size: {self.patch_size if self.subset == 'train' else 'Full'})..."
+            f">> Created 3D {subset} dataset with {len(self.files)} volumes "
+            f"(Augmentation: {self.augmentor is not None}, Resampling: {self.resample})..."
         )
 
-    def _pad_if_needed(
-        self, ct: torch.Tensor, gt: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Pads volume with constant values if any dimension is smaller than patch size."""
-        _, z, h, w = ct.shape
-        pz, ph, pw = self.patch_size
-
-        pad_z = max(0, pz - z)
-        pad_h = max(0, ph - h)
-        pad_w = max(0, pw - w)
-
-        if pad_z > 0 or pad_h > 0 or pad_w > 0:
-            pad_tuple = (0, pad_w, 0, pad_h, 0, pad_z)
-            ct = F.pad(ct, pad_tuple, mode="constant", value=ct.min().item())
-            gt = F.pad(gt, pad_tuple, mode="constant", value=0)
-
-        return ct, gt
-
-    def _crop_patch(
-        self, ct: torch.Tensor, gt: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extracts a random or foreground-guided 3D patch from 1-channel tensors."""
-        ct, gt = self._pad_if_needed(ct, gt)
-        _, z, h, w = ct.shape
-        pz, ph, pw = self.patch_size
-
-        # Search foreground indices directly on the 1-channel class label mask
-        gt_mask = gt.squeeze(0)
-        fg_indices = torch.argwhere((gt_mask > 0) & (gt_mask <= 4))
-
-        if len(fg_indices) > 0 and random.random() < 0.5:
-            idx = random.randint(0, len(fg_indices) - 1)
-            cz, ch, cw = fg_indices[idx].tolist()
-            z_start = max(0, min(cz - pz // 2, z - pz))
-            h_start = max(0, min(ch - ph // 2, h - ph))
-            w_start = max(0, min(cw - pw // 2, w - pw))
-        else:
-            z_start = random.randint(0, z - pz)
-            h_start = random.randint(0, h - ph)
-            w_start = random.randint(0, w - pw)
-
-        ct_patch = ct[
-            :, z_start : z_start + pz, h_start : h_start + ph, w_start : w_start + pw
-        ]
-        gt_patch = gt[
-            :, z_start : z_start + pz, h_start : h_start + ph, w_start : w_start + pw
-        ]
-
-        return ct_patch, gt_patch
-
     def __len__(self):
-        if self.subset == "train" and self.patch_size is not None:
-            return len(self.files) * self.samples_per_volume
         return len(self.files)
 
     def __getitem__(self, index: int) -> dict:
-        file_idx = (
-            index // self.samples_per_volume
-            if (self.subset == "train" and self.patch_size is not None)
-            else index
-        )
-        patient_id = self.files[file_idx]
+        patient_id = self.files[index]
         patient_path = self.data_path / patient_id
 
         # 1. Load CT Volume
@@ -493,23 +428,17 @@ class Segthor3DDataset(Dataset):
             torch.from_numpy(ct).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
         )
 
-        # Skip downscaling to (128, 256, 256) if patch_size is active!
-        if self.patch_size is None:
-            ct_processed_tensor = F.interpolate(
-                ct_tensor,
-                size=self.shape,
-                mode="trilinear",
-                align_corners=False,
-            ).squeeze(
-                0
-            )  # Shape: [1, 128, 256, 256]
-        else:
-            ct_processed_tensor = ct_tensor.squeeze(
-                0
-            )  # Native / Resampled [1, Z, H, W]
+        ct_resized = torch.nn.functional.interpolate(
+            ct_tensor,
+            size=self.shape,
+            mode="trilinear",
+            align_corners=False,
+        ).squeeze(
+            0
+        )  # Shape: [1, 128, 256, 256]
 
         data_dict = {
-            "images": ct_processed_tensor,
+            "images": ct_resized,
             "stems": patient_id,
             "affine": torch.from_numpy(affine).float(),
             "orig_shape": torch.tensor(orig_shape),
@@ -533,36 +462,25 @@ class Segthor3DDataset(Dataset):
                 torch.from_numpy(gt).float().permute(2, 0, 1).unsqueeze(0).unsqueeze(0)
             )
 
-            if self.patch_size is None:
-                gt_processed_tensor = F.interpolate(
+            gt_resized = (
+                torch.nn.functional.interpolate(
                     gt_tensor,
                     size=self.shape,
                     mode="nearest",
-                ).squeeze(0)
-            else:
-                gt_processed_tensor = gt_tensor.squeeze(0)  # Shape: [1, Z, H, W]
-
-            gt_processed_tensor = gt_processed_tensor.long()
-
-            # --- STEP 1: CROP 3D PATCH FIRST (1-channel tensors) ---
-            if self.subset == "train" and self.patch_size is not None:
-                ct_processed_tensor, gt_processed_tensor = self._crop_patch(
-                    ct_processed_tensor, gt_processed_tensor
                 )
+                .squeeze(0)
+                .squeeze(0)
+                .long()
+            )
 
-            # --- STEP 2: ONE-HOT ENCODE ONLY THE SMALL PATCH ---
-            gt_one_hot = F.one_hot(gt_processed_tensor.squeeze(0), num_classes=5)
-            gt_one_hot = gt_one_hot.permute(
-                3, 0, 1, 2
-            ).float()  # Shape: [5, pZ, pH, pW]
+            gt_one_hot = torch.nn.functional.one_hot(gt_resized, num_classes=5)
+            gt_one_hot = gt_one_hot.permute(3, 0, 1, 2).float()
 
-            # --- STEP 3: APPLY 3D AUGMENTATIONS ONLY TO THE PATCH ---
+            # --- 3D AUGMENTATIONS ---
             if self.augmentor is not None:
-                ct_processed_tensor, gt_one_hot = self.augmentor(
-                    ct_processed_tensor, gt_one_hot
-                )
+                ct_resized, gt_one_hot = self.augmentor(ct_resized, gt_one_hot)
 
-            data_dict["images"] = ct_processed_tensor
+            data_dict["images"] = ct_resized
             data_dict["gts"] = gt_one_hot.bool()
 
         return data_dict
