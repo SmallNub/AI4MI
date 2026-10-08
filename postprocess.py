@@ -447,6 +447,147 @@ def evaluate_policies(
     return best_processed_arr, best_preset, best_score, best_records
 
 
+def load_patient_prediction(
+    patient_id: str,
+    pred_dir: Path,
+    preprocessed_scan_pattern: str,
+    is_2d_input: bool,
+    num_classes: int,
+) -> Tuple[nib.nifti1.Nifti1Image, np.ndarray]:
+    """Load one patient prediction in the preprocessed reference geometry."""
+    prep_nii_path = Path(preprocessed_scan_pattern.format(id_=patient_id))
+    if not prep_nii_path.exists():
+        raise FileNotFoundError(f"Preprocessed reference NIfTI not found: {prep_nii_path}")
+
+    reference = nib.load(str(prep_nii_path))
+    X, Y, Z = reference.shape
+
+    if is_2d_input:
+        slice_files = [
+            path
+            for path in pred_dir.glob(f"{patient_id}_*")
+            if path.suffix in [".png", ".npy", ".jpg", ".tif"]
+        ]
+        if not slice_files:
+            raise FileNotFoundError(f"No 2D prediction slices found for {patient_id}")
+        if len(slice_files) != Z:
+            raise ValueError(
+                f"Slice count mismatch for {patient_id}: reference Z={Z}, "
+                f"prediction slices={len(slice_files)}"
+            )
+
+        prediction = np.zeros((X, Y, Z), dtype=np.uint8)
+        for slice_path in slice_files:
+            z = get_z_index(slice_path)
+            if not 0 <= z < Z:
+                raise ValueError(f"Slice index {z} out of bounds for {patient_id} (Z={Z})")
+            img_arr = np.load(slice_path) if slice_path.suffix == ".npy" else imread(slice_path)
+            if img_arr.max() > num_classes:
+                img_arr = (img_arr // 63).astype(np.uint8)
+            if img_arr.shape != (X, Y):
+                img_arr = resize(
+                    img_arr,
+                    (X, Y),
+                    mode="constant",
+                    preserve_range=True,
+                    anti_aliasing=False,
+                    order=0,
+                )
+            prediction[:, :, z] = img_arr.astype(np.uint8)
+    else:
+        prediction_path = pred_dir / f"{patient_id}.nii.gz"
+        if not prediction_path.exists():
+            prediction_path = pred_dir / patient_id / f"{patient_id}.nii.gz"
+        if not prediction_path.exists():
+            raise FileNotFoundError(f"3D prediction NIfTI not found for {patient_id}")
+        prediction = np.asarray(nib.load(str(prediction_path)).dataobj, dtype=np.uint8)
+
+    if prediction.shape != reference.shape:
+        raise ValueError(
+            f"Prediction/reference shape mismatch for {patient_id}: "
+            f"{prediction.shape} vs {reference.shape}"
+        )
+    return reference, prediction
+
+
+def select_global_policy(
+    patient_ids: List[str],
+    pred_dir: Path,
+    preprocessed_scan_pattern: str,
+    gt_scan_pattern: str,
+    is_2d_input: bool,
+    num_classes: int,
+    label_order: List[int],
+) -> Dict[str, Any]:
+    """Select one policy by mean patient/class Dice over the validation set."""
+    if not patient_ids:
+        raise ValueError("No patients available for global policy evaluation")
+
+    preset_scores: Dict[str, List[float]] = {
+        preset: [] for preset in BUILTIN_POLICIES
+    }
+    class_scores: Dict[str, Dict[int, List[float]]] = {
+        preset: {class_id: [] for class_id in label_order}
+        for preset in BUILTIN_POLICIES
+    }
+
+    for patient_id in tqdm(patient_ids, desc="Evaluating policies", unit="patient"):
+        reference, prediction = load_patient_prediction(
+            patient_id,
+            pred_dir,
+            preprocessed_scan_pattern,
+            is_2d_input,
+            num_classes,
+        )
+        gt_path = Path(gt_scan_pattern.format(id_=patient_id))
+        if not gt_path.exists():
+            raise FileNotFoundError(f"Ground truth not found for {patient_id}: {gt_path}")
+        target = np.asarray(nib.load(str(gt_path)).dataobj, dtype=np.uint8)
+        if target.shape != prediction.shape:
+            raise ValueError(
+                f"Prediction/ground-truth shape mismatch for {patient_id}: "
+                f"{prediction.shape} vs {target.shape}"
+            )
+
+        spacing = tuple(float(value) for value in reference.header.get_zooms()[:3])
+        for preset_name in BUILTIN_POLICIES:
+            processed, _ = postprocess_volume(
+                labels=prediction,
+                spacing=spacing,
+                policy_by_label=load_policy(preset_name),
+                label_order=label_order,
+            )
+            dice_by_class = compute_dice_score(processed, target, labels=label_order)
+            for class_id, score in dice_by_class.items():
+                class_scores[preset_name][class_id].append(score)
+                preset_scores[preset_name].append(score)
+
+    comparisons = []
+    for preset_name in BUILTIN_POLICIES:
+        per_class = {
+            str(class_id): float(np.mean(scores))
+            for class_id, scores in class_scores[preset_name].items()
+        }
+        comparisons.append(
+            {
+                "preset": preset_name,
+                "mean_patient_class_dice": float(np.mean(preset_scores[preset_name])),
+                "per_class_mean_dice": per_class,
+            }
+        )
+
+    winner = max(comparisons, key=lambda item: item["mean_patient_class_dice"])
+    selected_preset = winner["preset"]
+    return {
+        "selection_method": "mean_patient_class_dice",
+        "selected_preset": selected_preset,
+        "selected_policy": load_policy(selected_preset),
+        "selected_mean_patient_class_dice": winner["mean_patient_class_dice"],
+        "evaluated_patients": patient_ids,
+        "candidate_results": comparisons,
+    }
+
+
 # ==============================================================================
 # 3. HELPER FUNCTIONS
 # ==============================================================================
@@ -493,112 +634,33 @@ def process_patient(
     preset: str = "lcc_3d_non_esophagus",
     config_path: Optional[Path] = None,
     label_order: Optional[List[int]] = None,
-    evaluate_all: bool = False,
+    selected_policy: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     # 1. Load Preprocessed Reference Volume (X, Y, Z) via Nibabel
-    prep_nii_path = Path(preprocessed_scan_pattern.format(id_=patient_id))
-    if not prep_nii_path.exists():
-        print(f"[Warning] Preprocessed reference NIfTI not found: {prep_nii_path}")
+    try:
+        orig_nib, res_arr = load_patient_prediction(
+            patient_id,
+            pred_dir,
+            preprocessed_scan_pattern,
+            is_2d_input,
+            num_classes,
+        )
+    except FileNotFoundError as error:
+        print(f"[Warning] {error}")
         return
 
-    orig_nib = nib.load(str(prep_nii_path))
-    X, Y, Z = orig_nib.shape
-
     out_nii_path = output_dir / f"{patient_id}.nii.gz"
-
-    if is_2d_input:
-        # Collect and sort 2D slice files for this patient
-        slice_files = [
-            p
-            for p in pred_dir.glob(f"{patient_id}_*")
-            if p.suffix in [".png", ".npy", ".jpg", ".tif"]
-        ]
-        if not slice_files:
-            print(f"[Warning] No 2D slice files found for patient {patient_id}")
-            return
-
-        assert (
-            len(slice_files) == Z
-        ), f"Slice count mismatch for patient {patient_id}: prep scan Z={Z}, slices={len(slice_files)}"
-
-        res_arr = np.zeros((X, Y, Z), dtype=np.uint8)
-
-        for slice_path in slice_files:
-            z = get_z_index(slice_path)
-            if slice_path.suffix == ".npy":
-                img_arr = np.load(slice_path)
-            else:
-                img_arr = imread(slice_path)
-
-            if img_arr.max() > num_classes:
-                img_arr = (img_arr // 63).astype(np.uint8)
-
-            # Resize to preprocessed target (X, Y) using nearest-neighbor interpolation
-            if img_arr.shape != (X, Y):
-                resized = resize(
-                    img_arr,
-                    (X, Y),
-                    mode="constant",
-                    preserve_range=True,
-                    anti_aliasing=False,
-                    order=0,
-                ).astype(np.uint8)
-            else:
-                resized = img_arr.astype(np.uint8)
-
-            res_arr[:, :, z] = resized
-
-    else:
-        # 3D Model NIfTI input
-        pred_3d_path = pred_dir / f"{patient_id}.nii.gz"
-        if not pred_3d_path.exists():
-            pred_3d_path = pred_dir / patient_id / f"{patient_id}.nii.gz"
-
-        if not pred_3d_path.exists():
-            print(f"[Warning] 3D prediction NIfTI not found for {patient_id}")
-            return
-
-        pred_nib = nib.load(str(pred_3d_path))
-        res_arr = np.asarray(pred_nib.dataobj, dtype=np.uint8)
 
     # 2. Evaluate & Apply Post-Processing Policies
     if apply_post:
         spacing = tuple(float(v) for v in orig_nib.header.get_zooms()[:3])
-
-        # Load GT if path pattern provided and exists
-        gt_arr = None
-        if gt_scan_pattern:
-            gt_path = Path(gt_scan_pattern.format(id_=patient_id))
-            if gt_path.exists():
-                gt_nib = nib.load(str(gt_path))
-                gt_arr = np.asarray(gt_nib.dataobj, dtype=np.uint8)
-
-        if evaluate_all or gt_arr is not None:
-            # Loop through all built-in policies and pick the best method
-            res_arr, selected_preset, best_score, _ = evaluate_policies(
-                labels=res_arr,
-                spacing=spacing,
-                gt_labels=gt_arr,
-                candidate_presets=list(BUILTIN_POLICIES.keys()),
-                label_order=label_order or [1, 2, 3, 4],
-            )
-            score_msg = (
-                f"Mean Dice: {best_score:.4f}"
-                if gt_arr is not None
-                else f"Score: {best_score:.4f}"
-            )
-            print(
-                f"[{patient_id}] Selected best post-processing policy: '{selected_preset}' ({score_msg})"
-            )
-        else:
-            # Apply single specified preset
-            policy = load_policy(preset, config_path)
-            res_arr, _ = postprocess_volume(
-                labels=res_arr,
-                spacing=spacing,
-                policy_by_label=policy,
-                label_order=label_order or [1, 2, 3, 4],
-            )
+        policy = selected_policy or load_policy(preset, config_path)
+        res_arr, _ = postprocess_volume(
+            labels=res_arr,
+            spacing=spacing,
+            policy_by_label=policy,
+            label_order=label_order or [1, 2, 3, 4],
+        )
 
     # 3. Save initial volume using preprocessed affine matrix & header
     new_nib = nib.nifti1.Nifti1Image(
@@ -677,7 +739,19 @@ def main():
     parser.add_argument(
         "--evaluate_all_policies",
         action="store_true",
-        help="Loop through all post-processing policies, evaluate each, and select the best method",
+        help=(
+            "Evaluate every built-in policy across all supplied patients using "
+            "mean patient/class Dice, save the global winner, and apply it"
+        ),
+    )
+    parser.add_argument(
+        "--policy-selection",
+        type=Path,
+        default=None,
+        help=(
+            "Load a policy selection JSON previously created by "
+            "--evaluate_all_policies (use this for test inference)"
+        ),
     )
     parser.add_argument(
         "--preset",
@@ -708,6 +782,15 @@ def main():
 
     args = parser.parse_args()
 
+    if args.evaluate_all_policies and not args.post:
+        parser.error("--evaluate_all_policies requires --post")
+    if args.evaluate_all_policies and not args.gt_scan_pattern:
+        parser.error("--evaluate_all_policies requires --gt_scan_pattern")
+    if args.evaluate_all_policies and args.policy_selection:
+        parser.error("Use either --evaluate_all_policies or --policy-selection")
+    if args.policy_selection and args.config:
+        parser.error("--policy-selection already contains a complete policy; omit --config")
+
     args.dest_folder.mkdir(parents=True, exist_ok=True)
 
     patient_ids = set()
@@ -727,6 +810,40 @@ def main():
     patient_list = sorted(list(patient_ids))
     print(f">> Processing {len(patient_list)} patients from {args.pred_dir}...")
 
+    selected_policy = None
+    selected_preset = args.preset
+    if args.policy_selection:
+        with args.policy_selection.open() as selection_file:
+            selection = json.load(selection_file)
+        selected_preset = selection.get("selected_preset")
+        selected_policy = selection.get("selected_policy")
+        if selected_preset not in BUILTIN_POLICIES or not isinstance(
+            selected_policy, dict
+        ):
+            parser.error(f"Invalid policy selection file: {args.policy_selection}")
+        validate_policy(selected_policy)
+        print(f">> Applying saved global policy: {selected_preset}")
+    elif args.evaluate_all_policies:
+        selection = select_global_policy(
+            patient_ids=patient_list,
+            pred_dir=args.pred_dir,
+            preprocessed_scan_pattern=args.preprocessed_scan_pattern,
+            gt_scan_pattern=args.gt_scan_pattern,
+            is_2d_input=args.is_2d_input,
+            num_classes=args.num_classes,
+            label_order=args.label_order,
+        )
+        selection_path = args.dest_folder / "postprocessing_policy.json"
+        with selection_path.open("w") as selection_file:
+            json.dump(selection, selection_file, indent=2)
+        selected_preset = selection["selected_preset"]
+        selected_policy = selection["selected_policy"]
+        print(
+            f">> Selected global policy {selected_preset} with mean patient/class "
+            f"Dice {selection['selected_mean_patient_class_dice']:.4f}"
+        )
+        print(f">> Saved policy comparison to {selection_path}")
+
     pfun = partial(
         process_patient,
         pred_dir=args.pred_dir,
@@ -737,10 +854,10 @@ def main():
         num_classes=args.num_classes,
         apply_post=args.post,
         is_2d_input=args.is_2d_input,
-        preset=args.preset,
+        preset=selected_preset,
         config_path=args.config,
         label_order=args.label_order,
-        evaluate_all=args.evaluate_all_policies,
+        selected_policy=selected_policy,
     )
 
     if args.process == 1:

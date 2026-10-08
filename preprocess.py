@@ -82,13 +82,20 @@ def process_patient_folder(
     output_root: Path,
     target_spacing: Tuple[float, float, float],
 ) -> None:
-    """Processes CT volume and optional GT mask for a single patient directory."""
-    patient_id = patient_dir.name
-    out_patient_dir = output_root / patient_dir.relative_to(input_root)
+    """Processes a patient directory or a flat NIfTI volume."""
+    flat_volume = patient_dir.is_file()
+    patient_id = (
+        patient_dir.name.removesuffix(".nii.gz") if flat_volume else patient_dir.name
+    )
+    out_patient_dir = (
+        output_root / patient_dir.parent.relative_to(input_root)
+        if flat_volume
+        else output_root / patient_dir.relative_to(input_root)
+    )
     out_patient_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Process CT Image
-    ct_path = patient_dir / f"{patient_id}.nii.gz"
+    ct_path = patient_dir if flat_volume else patient_dir / f"{patient_id}.nii.gz"
     if ct_path.exists():
         ct_sitk = sitk.ReadImage(str(ct_path))
         ct_resampled = resample_sitk_image(
@@ -98,8 +105,8 @@ def process_patient_folder(
         sitk.WriteImage(ct_normalized, str(out_patient_dir / f"{patient_id}.nii.gz"))
 
     # 2. Process Ground Truth Mask (if present)
-    gt_path = patient_dir / "GT.nii.gz"
-    if gt_path.exists():
+    gt_path = None if flat_volume else patient_dir / "GT.nii.gz"
+    if gt_path is not None and gt_path.exists():
         gt_sitk = sitk.ReadImage(str(gt_path))
         gt_resampled = resample_sitk_image(
             gt_sitk, target_spacing=target_spacing, is_mask=True
@@ -114,7 +121,7 @@ def main():
         "--input_dir",
         type=str,
         required=True,
-        help="Input directory containing patient folders",
+        help="Input directory containing patient folders or flat .nii.gz files",
     )
     parser.add_argument(
         "--output_dir", type=str, required=True, help="Output destination directory"
@@ -140,14 +147,14 @@ def main():
     output_root = Path(args.output_dir)
     target_spacing = tuple(args.target_spacing)
 
-    # Find all subdirectories containing NIfTI files
-    patient_dirs = sorted(
-        [
-            p
-            for p in input_root.rglob("*")
-            if p.is_dir() and (p / f"{p.name}.nii.gz").exists()
-        ]
-    )
+    # Find nested patient folders and flat NIfTI files (such as the test set).
+    patient_dirs = [
+        p
+        for p in input_root.rglob("*")
+        if p.is_dir() and (p / f"{p.name}.nii.gz").exists()
+    ]
+    flat_volumes = list(input_root.glob("*.nii.gz"))
+    patient_dirs = sorted(patient_dirs + flat_volumes)
 
     print(f">> Processing {len(patient_dirs)} patient folders from {input_root}...")
 
