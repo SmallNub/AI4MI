@@ -138,13 +138,26 @@ def save_boxplot(
     title: str | None = None,
     class_labels: list[str] | None = None,
     model_labels: dict[str, str] | None = None,
+    model_order: list[str] | None = None,
 ) -> None:
     selected = seed_metrics[seed_metrics["metric"] == metric]
     if selected.empty:
         available = ", ".join(sorted(seed_metrics["metric"].unique()))
         raise ValueError(f"Metric {metric!r} not found. Available metrics: {available}")
 
-    model_names = sorted(selected["model"].unique())
+    available_models = sorted(selected["model"].unique())
+    if model_order is not None:
+        missing_models = set(available_models) - set(model_order)
+        unknown_models = set(model_order) - set(available_models)
+        if missing_models or unknown_models or len(model_order) != len(available_models):
+            raise ValueError(
+                "--model-order must list each model ID exactly once. "
+                f"Missing: {sorted(missing_models)}; "
+                f"unknown: {sorted(unknown_models)}"
+            )
+        model_names = model_order
+    else:
+        model_names = available_models
     model_display_names = [
         (model_labels or {}).get(model, model) for model in model_names
     ]
@@ -228,6 +241,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--model-order",
+        nargs="+",
+        default=None,
+        metavar="MODEL_ID",
+        help=(
+            "Optional box order, using inferred model IDs, e.g. "
+            "--model-order compound ce"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -260,6 +283,7 @@ def main() -> None:
         title=args.title,
         class_labels=args.class_labels,
         model_labels=model_labels,
+        model_order=args.model_order,
     )
 
     print(summary.to_string(index=False))
