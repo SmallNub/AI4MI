@@ -104,7 +104,7 @@ models_params["ImprovedENet"] = {
 }
 models_params["ViT"] = {
     "net": ViT,
-    "args": {"kernels": 16, "z_window": 15},
+    "args": {"kernels": 8, "z_window": 15},
 }
 models_params["ImprovedENet3D"] = {
     "net": ImprovedENet3D,
