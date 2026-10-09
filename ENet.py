@@ -26,6 +26,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import math
+import hypll.nn as hnn
+from hypll.manifolds.poincare_ball import PoincareBall, Curvature
+from hypll.tensors.tangent_tensor import TangentTensor
 
 
 def random_weights_init(m):
@@ -465,3 +469,51 @@ class LateFusionENet(ENet):
         return _enet_decode(
             self, center_output_initial, center_bn1_out, fused_bn3, center_indices
         )
+
+class HyperbolicENet(ENet):
+    def __init__(self, in_dim: int, out_dim: int, **kwargs):
+        super().__init__(in_dim, out_dim, **kwargs)
+        K = kwargs.get("kernels", 16)
+        
+        curvature: float = kwargs.get("curvature", 0.1)
+        self.clip_r: float = kwargs.get("clip_r", 2.3)
+        self.manifold = PoincareBall(
+            c=Curvature(value=math.log(math.expm1(curvature)), requires_grad=True)
+        )
+
+        self.h_conv = hnn.HConvolution2d(
+            in_channels=K,
+            out_channels=K,
+            kernel_size=1,
+            manifold=self.manifold,
+        )
+        
+        self.final_logits = nn.Conv2d(K, out_dim, kernel_size=1)
+
+    @torch.compiler.disable
+    def _hyperbolic_head(self, features: Tensor) -> Tensor:
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            features = features.float()
+            
+            norm = features.norm(dim=1, keepdim=True).clamp_min(1e-6)
+            features = features * (self.clip_r / norm).clamp(max=1.0)
+
+            tangent_f = TangentTensor(data=features, manifold=self.manifold, man_dim=1)
+            hyperbolic_f = self.manifold.expmap(tangent_f)
+            hyperbolic_features = self.h_conv(hyperbolic_f)
+            tangent_out = self.manifold.logmap(None, hyperbolic_features)
+            
+            return self.final_logits(tangent_out.tensor)
+
+    def forward(self, input: Tensor) -> Tensor:
+        output_initial, bn1_out, bn2_out, indices = _enet_features(self, input)
+        bn3_out = self.bottleneck3(bn2_out)
+        
+        indices_1, indices_2 = indices
+        bn4_out = self.bottleneck4((bn3_out, indices_2, bn1_out))
+        bn5_out = self.bottleneck5((bn4_out, indices_1, output_initial))
+
+        interpolated = F.interpolate(bn5_out, mode="nearest", scale_factor=2)
+        features = self.final[:2](interpolated)
+        
+        return self._hyperbolic_head(features)
