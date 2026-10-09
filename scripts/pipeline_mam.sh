@@ -17,15 +17,15 @@ source ai4mi/bin/activate
 
 export IS_SNELLIUS=1
 
-echo "Data Preprocessing..."
+# echo "Data Preprocessing..."
 
-rm -rf data/segthor_processed
-python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
+# rm -rf data/segthor_processed
+# python preprocess.py --input_dir data/segthor_train_full/train --output_dir data/segthor_processed/train -p 4
 
-echo "Slicing..."
+# echo "Slicing..."
 
-rm -rf data/SEGTHOR_processed
-make data/SEGTHOR_processed
+# rm -rf data/SEGTHOR_processed
+# make data/SEGTHOR_processed
 
 MODEL="MambaNet"
 SEEDS=(42 43 44 45 46)
