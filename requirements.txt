@@ -6,6 +6,7 @@ cycler==0.12.1
 filelock==3.32.5
 fonttools==4.64.0
 fsspec==2026.7.0
+hypll==0.1.1
 ImageIO==2.37.4
 Jinja2==3.1.6
 kiwisolver==1.5.1

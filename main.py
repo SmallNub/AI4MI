@@ -82,6 +82,7 @@ datasets_params["segthor_processed"] = {"K": 5, "B": 4}
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
 models_params["ENet"] = {"net": ENet, "args": {"kernels": 8, "factor": 2}}
+models_params["ENet25D"] = {"net": ENet, "args": {"kernels": 8, "factor": 2, "z_window": 15}}
 models_params["AttentionENet"] = {
     "net": AttentionENet,
     "args": {"kernels": 8, "factor": 2},

@@ -221,7 +221,8 @@ def _enet_features(
     net: "ENet", input: Tensor
 ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor, Tensor]]:
     conv_0 = net.conv0(input)
-    maxpool_0 = net.maxpool0(input)
+    pool_input = net.pool_projection(input)
+    maxpool_0 = net.maxpool0(pool_input)
     output_initial = torch.cat((conv_0, maxpool_0), dim=1)
 
     bn1_0, indices_1 = net.bottleneck1_0(output_initial)
@@ -259,6 +260,11 @@ class ENet(nn.Module):
 
         # Initial operations
         self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1)
+        self.pool_projection = (
+            nn.Identity()
+            if in_dim == 1
+            else nn.Conv2d(in_dim, 1, kernel_size=1, bias=True)
+        )
         self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
 
         # Downsampling half
@@ -317,7 +323,7 @@ class ENet(nn.Module):
     def forward(self, input):
         # Initial operations
         conv_0 = self.conv0(input)
-        maxpool_0 = self.maxpool0(input)
+        maxpool_0 = self.maxpool0(self.pool_projection(input))
         outputInitial = torch.cat((conv_0, maxpool_0), dim=1)
 
         # Downsampling half
