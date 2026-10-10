@@ -124,16 +124,28 @@ class GeneralizedDice:
         self.smooth = 1e-1
 
     def __call__(self, pred_softmax: Tensor, weak_target: Tensor) -> Tensor:
+        if pred_softmax.shape != weak_target.shape:
+            raise ValueError(
+                f"Prediction and target shapes differ: "
+                f"{pred_softmax.shape} vs {weak_target.shape}"
+            )
+        if pred_softmax.ndim < 4:
+            raise ValueError(
+                "Generalized Dice expects [B, C, H, W] or "
+                "[B, C, D, H, W] tensors"
+            )
+
         p = pred_softmax.float()
         t = weak_target.float()
+        reduction_dims = (0, *range(2, pred_softmax.ndim))
 
-        volumes = torch.sum(t, dim=(0, 2, 3))
+        volumes = torch.sum(t, dim=reduction_dims)
 
         v_frac = volumes / torch.clamp(torch.sum(volumes), min=self.eps)
         weights = 1.0 / (torch.square(v_frac) + self.smooth)
 
-        intersection = torch.sum(p * t, dim=(0, 2, 3))
-        cardinality = torch.sum(p, dim=(0, 2, 3)) + volumes
+        intersection = torch.sum(p * t, dim=reduction_dims)
+        cardinality = torch.sum(p, dim=reduction_dims) + volumes
 
         weights = weights[self.idk]
         intersection = intersection[self.idk]

@@ -458,7 +458,7 @@ def runTraining(args):
                         if isinstance(out, tuple):
                             pred_logits, aux_logits = out
                             aux_probs = F.softmax(aux_logits, dim=1)
-                            loss_aux, *_ = loss_fn.aux_loss_fn(aux_probs, gt)
+                            loss_aux, *_ = loss_fn(aux_probs, gt)
                         else:
                             pred_logits = out
                             loss_aux = 0.0
