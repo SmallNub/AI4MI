@@ -339,6 +339,7 @@ class Segthor3DDataset(Dataset):
         z_window: int = 1,
         resample: bool = False,
         target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        validation_2d_root: str | Path = "data/SEGTHOR_processed",
     ):
         assert subset in ["train", "val", "test"]
 
@@ -351,6 +352,7 @@ class Segthor3DDataset(Dataset):
         self.shape = (128, 256, 256)
         self.resample = resample
         self.target_spacing = target_spacing
+        self.validation_2d_root = Path(validation_2d_root)
 
         raw_folder = "test" if self.test_mode else "train"
         self.data_path = self.root_dir / raw_folder
@@ -365,22 +367,39 @@ class Segthor3DDataset(Dataset):
             ]
         )
 
-        if debug:
-            all_ids = all_ids[:10]
-
         if not self.test_mode:
-            random.shuffle(all_ids)
-            total_volumes = len(all_ids)
-            retains = 5 if total_volumes >= 5 else max(1, total_volumes)
-            fold = 0
+            validation_img_dir = self.validation_2d_root / "val" / "img"
+            if not validation_img_dir.is_dir():
+                raise FileNotFoundError(
+                    "2D validation images not found at "
+                    f"{validation_img_dir}; expected the pre-sliced 2D dataset"
+                )
 
-            val_slice = slice(fold * retains, (fold + 1) * retains)
-            val_ids = all_ids[val_slice]
-            train_ids = [x for x in all_ids if x not in val_ids]
+            validation_ids = set()
+            for image_path in validation_img_dir.glob("*.npy"):
+                patient_id, separator, slice_index = image_path.stem.rpartition("_")
+                if separator and slice_index.isdigit():
+                    validation_ids.add(patient_id)
 
+            if not validation_ids:
+                raise ValueError(
+                    f"No patient slice files found in {validation_img_dir}"
+                )
+
+            missing_ids = validation_ids - set(all_ids)
+            if missing_ids:
+                raise ValueError(
+                    "2D validation patients are missing from the 3D dataset: "
+                    f"{sorted(missing_ids)}"
+                )
+
+            val_ids = sorted(validation_ids)
+            train_ids = [patient_id for patient_id in all_ids if patient_id not in validation_ids]
+            if debug:
+                train_ids = train_ids[:10]
             self.files = train_ids if subset == "train" else val_ids
         else:
-            self.files = all_ids
+            self.files = all_ids[:10] if debug else all_ids
 
         # Initialize conservative 3D augmentation module
         if self.augment and self.subset == "train":
