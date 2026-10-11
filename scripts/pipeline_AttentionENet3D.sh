@@ -69,7 +69,6 @@ for SEED in "${SEEDS[@]}"; do
         --gt_scan_pattern "data/segthor_processed/train/{id_}/GT.nii.gz" \
         --dest_folder "$DEST_VOLUMES" \
         --grp_regex "^(Patient_\d+)" \
-        --is_2d_input \
         --num_classes 5 \
         --post \
         --evaluate_all_policies \
