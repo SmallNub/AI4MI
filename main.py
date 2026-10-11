@@ -56,6 +56,7 @@ from MambaNet3D import MambaNet3D
 from ImprovedENet import ImprovedENet
 from ImprovedENet3D import ImprovedENet3D
 from ENet3D import ENet3D, AttentionENet3D
+from ENet3D_old import ENet3D as ENet3D_old
 from ViT import ViT
 from utils import (
     Dcm,
@@ -118,6 +119,14 @@ models_params["MambaNet"] = {
 models_params["MambaNet3D"] = {
     "net": MambaNet3D,
     "args": {"kernels": 16},
+}
+models_params["ENet3D_old_small"] = {
+    "net": ENet3D_old,
+    "args": {"kernels": 8, "factor": 2},
+}
+models_params["ENet3D_old"] = {
+    "net": ENet3D_old,
+    "args": {"kernels": 16, "factor": 4},
 }
 models_params["ENet3D"] = {
     "net": ENet3D,
