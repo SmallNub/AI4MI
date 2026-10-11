@@ -338,6 +338,9 @@ def setup(
 
     if is_3d_model:
         dataset_kwargs["target_spacing"] = tuple(args.target_spacing)
+        dataset_kwargs["validation_split"] = args.val_split
+        dataset_kwargs["validation_size"] = args.val_size
+        dataset_kwargs["validation_seed"] = args.val_seed
 
     train_set = DatasetClass(
         "train",
@@ -758,6 +761,30 @@ def main():
         default=[1.0, 1.0, 1.0],
         type=float,
         help="Target spacing for resampling volumes (3 floats, e.g. 1.0 1.0 1.0).",
+    )
+    parser.add_argument(
+        "--val-split",
+        choices=["2d", "random"],
+        default="2d",
+        help=(
+            "3D validation cohort source: '2d' reuses the sliced dataset's val IDs; "
+            "'random' selects a separate fixed cohort"
+        ),
+    )
+    parser.add_argument(
+        "--val-size",
+        type=int,
+        default=5,
+        help="Number of validation patients when --val-split=random (default: 5)",
+    )
+    parser.add_argument(
+        "--val-seed",
+        type=int,
+        default=0,
+        help=(
+            "Fixed seed used only to choose the random validation cohort; "
+            "independent of the training --seed"
+        ),
     )
 
     args = parser.parse_args()

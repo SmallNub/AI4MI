@@ -340,6 +340,9 @@ class Segthor3DDataset(Dataset):
         resample: bool = False,
         target_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
         validation_2d_root: str | Path = "data/SEGTHOR_processed",
+        validation_split: str = "2d",
+        validation_size: int = 5,
+        validation_seed: int = 0,
     ):
         assert subset in ["train", "val", "test"]
 
@@ -353,6 +356,9 @@ class Segthor3DDataset(Dataset):
         self.resample = resample
         self.target_spacing = target_spacing
         self.validation_2d_root = Path(validation_2d_root)
+        self.validation_split = validation_split
+        self.validation_size = validation_size
+        self.validation_seed = validation_seed
 
         raw_folder = "test" if self.test_mode else "train"
         self.data_path = self.root_dir / raw_folder
@@ -368,33 +374,53 @@ class Segthor3DDataset(Dataset):
         )
 
         if not self.test_mode:
-            validation_img_dir = self.validation_2d_root / "val" / "img"
-            if not validation_img_dir.is_dir():
-                raise FileNotFoundError(
-                    "2D validation images not found at "
-                    f"{validation_img_dir}; expected the pre-sliced 2D dataset"
-                )
+            if validation_split == "2d":
+                validation_img_dir = self.validation_2d_root / "val" / "img"
+                if not validation_img_dir.is_dir():
+                    raise FileNotFoundError(
+                        "2D validation images not found at "
+                        f"{validation_img_dir}; use validation_split='random' "
+                        "to create an independent 3D validation split"
+                    )
 
-            validation_ids = set()
-            for image_path in validation_img_dir.glob("*.npy"):
-                patient_id, separator, slice_index = image_path.stem.rpartition("_")
-                if separator and slice_index.isdigit():
-                    validation_ids.add(patient_id)
+                selected_validation_ids = set()
+                for image_path in validation_img_dir.glob("*.npy"):
+                    patient_id, separator, slice_index = image_path.stem.rpartition("_")
+                    if separator and slice_index.isdigit():
+                        selected_validation_ids.add(patient_id)
 
-            if not validation_ids:
+                if not selected_validation_ids:
+                    raise ValueError(
+                        f"No patient slice files found in {validation_img_dir}"
+                    )
+            elif validation_split == "random":
+                if not 0 < validation_size < len(all_ids):
+                    raise ValueError(
+                        f"validation_size must be between 1 and {len(all_ids) - 1}; "
+                        f"got {validation_size}"
+                    )
+                shuffled_ids = all_ids.copy()
+                random.Random(validation_seed).shuffle(shuffled_ids)
+                selected_validation_ids = set(shuffled_ids[:validation_size])
+            else:
                 raise ValueError(
-                    f"No patient slice files found in {validation_img_dir}"
+                    "validation_split must be either '2d' or 'random', "
+                    f"got {validation_split!r}"
                 )
 
-            missing_ids = validation_ids - set(all_ids)
+            missing_ids = selected_validation_ids - set(all_ids)
             if missing_ids:
                 raise ValueError(
-                    "2D validation patients are missing from the 3D dataset: "
+                    "Validation patients are missing from the 3D dataset: "
                     f"{sorted(missing_ids)}"
                 )
 
-            val_ids = sorted(validation_ids)
-            train_ids = [patient_id for patient_id in all_ids if patient_id not in validation_ids]
+            val_ids = sorted(selected_validation_ids)
+            train_ids = [
+                patient_id
+                for patient_id in all_ids
+                if patient_id not in selected_validation_ids
+            ]
             if debug:
                 train_ids = train_ids[:10]
             self.files = train_ids if subset == "train" else val_ids
