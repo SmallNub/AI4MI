@@ -27,14 +27,18 @@ datasets_params: dict[str, dict[str, Any]] = {
     "TOY2": {"K": 2, "net": shallowCNN, "B": 2, "kernels": 8, "factor": 2},
     "SEGTHOR": {"K": 5, "net": ENet, "B": 8, "kernels": 8, "factor": 2},
     "SEGTHOR_CLEAN": {"K": 5, "net": ENet, "B": 8, "kernels": 8, "factor": 2},
+    "SEGTHOR_processed": {"K": 5, "net": ENet, "B": 8, "kernels": 8, "factor": 2},
 }
 
 
 def img_transform(img):
-    img = img.convert("L")
-    img = np.array(img)[np.newaxis, ...]
-    img = img / 255  # max <= 1
-    return torch.tensor(img, dtype=torch.float32)
+    if hasattr(img, "convert"):
+        img = np.asarray(img.convert("L"), dtype=np.float32) / 255.0
+    else:
+        img = np.asarray(img, dtype=np.float32)
+        if img.max(initial=0) > 1:
+            img = img / 255.0
+    return torch.tensor(img[np.newaxis, ...], dtype=torch.float32)
 
 
 def gt_transform(K, img):
@@ -56,9 +60,6 @@ def run_inference(args):
     factor: int = config.get("factor", 2)
     B: int = config["B"]
 
-    # Instantiate network architecture
-    net = config["net"](1, K, kernels=kernels, factor=factor)
-
     # Load weights or full model
     weights_path = Path(args.weights)
     if not weights_path.exists():
@@ -66,10 +67,18 @@ def run_inference(args):
 
     print(f">> Loading model/weights from {weights_path}")
     if weights_path.suffix in [".pt", ".pth"]:
+        z_window = args.z_window or 1
+        net = config["net"](z_window, K, kernels=kernels, factor=factor)
         state_dict = torch.load(weights_path, map_location=device)
         net.load_state_dict(state_dict)
     else:
-        net = torch.load(weights_path, map_location=device)
+        net = torch.load(weights_path, map_location=device, weights_only=False)
+        if not hasattr(net, "conv0") or not hasattr(net.conv0, "in_channels"):
+            raise ValueError("Pickled model must expose conv0.in_channels for slice context")
+        z_window = int(net.conv0.in_channels)
+        if z_window % 2 == 0:
+            raise ValueError(f"Expected an odd slice window, found {z_window}")
+        print(f">> Using saved model input window: {z_window} slices")
 
     net.to(device)
     net.eval()
@@ -82,6 +91,7 @@ def run_inference(args):
         img_transform=img_transform,
         gt_transform=partial(gt_transform, K),
         debug=args.debug,
+        z_window=z_window,
     )
     loader = DataLoader(
         dataset,
@@ -159,6 +169,12 @@ def main():
         default="test",
         choices=["train", "val", "test"],
         help="Dataset split to run inference on",
+    )
+    parser.add_argument(
+        "--z_window",
+        type=int,
+        default=None,
+        help="Input slice window for state-dict checkpoints; pickled models infer it automatically",
     )
     parser.add_argument(
         "--dest",
