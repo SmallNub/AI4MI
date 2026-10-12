@@ -237,7 +237,7 @@ def volume_metrics(
     backend: str = "scipy",
     device: str = "cuda",
 ) -> dict[int, dict[str, float]]:
-    """Compute metrics for every foreground class in two label volumes."""
+    """Compute metrics for every class, including background, in two label volumes."""
 
     if prediction.shape != target.shape or prediction.ndim != 3:
         raise ValueError(
@@ -260,7 +260,7 @@ def volume_metrics(
             device,
         )
 
-    class_ids = list(range(1, num_classes))
+    class_ids = list(range(num_classes))
     results: dict[int, dict[str, float]] = {}
     if workers == 1:
         iterator = (
