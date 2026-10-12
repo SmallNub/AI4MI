@@ -34,10 +34,6 @@ from torch.utils.data import Dataset
 from torchvision.tv_tensors import Mask
 import torchvision.transforms.v2 as v2
 
-# =============================================================================
-# Helper Utilities & Preprocessing
-# =============================================================================
-
 
 def norm_arr(
     ct: np.ndarray, window_center: int = 40, window_width: int = 400
@@ -102,17 +98,7 @@ def make_dataset(root: str | Path, subset: str) -> list[tuple[Path, Path | None]
     return list(zip(images, full_labels))
 
 
-# =============================================================================
-# Augmentation Pipelines
-# =============================================================================
-
-
 class Segthor2DAugment:
-    """
-    Conservative 2D augmentation pipeline for SEGTHOR thoracic CT slices.
-    Preserves strict left/right anatomical asymmetry and thin boundary precision.
-    """
-
     def __init__(self, p_spatial: float = 0.3, p_intensity: float = 0.3):
         self.p_spatial = p_spatial
         self.p_intensity = p_intensity
@@ -120,27 +106,26 @@ class Segthor2DAugment:
         self.spatial_transform = v2.Compose(
             [
                 v2.RandomAffine(
-                    degrees=(-5, 5),  # Small rotation range
-                    translate=(0.05, 0.05),  # Max 3% spatial shift
-                    scale=(0.95, 1.05),  # Max 5% scale variation
+                    degrees=(-5, 5),
+                    translate=(0.05, 0.05),
+                    scale=(0.95, 1.05),
                     interpolation=v2.InterpolationMode.BILINEAR,
                 )
             ]
         )
 
     def __call__(self, img: torch.Tensor, mask: Mask) -> tuple[torch.Tensor, Mask]:
-        # Joint Spatial Transform (Image + Mask)
+        # Spatial augmentations
         if random.random() < self.p_spatial:
             img, mask = self.spatial_transform(img, mask)
 
-        # Intensity Transforms (Image Only)
         if random.random() < self.p_intensity:
-            # Low-amplitude Gaussian Noise
+            # Gaussian noise
             if random.random() < 0.5:
                 noise_std = random.uniform(0.005, 0.02)
                 img = img + torch.randn_like(img) * noise_std
 
-            # Mild Gamma Adjustment (Non-linear contrast variation)
+            # Gamma adjustment
             if random.random() < 0.5:
                 gamma = random.uniform(0.9, 1.1)
                 img_min = img.min()
@@ -150,11 +135,6 @@ class Segthor2DAugment:
 
 
 class Segthor3DAugment:
-    """
-    Conservative 3D volumetric augmentation pipeline for SEGTHOR CT volumes.
-    Uses 3D affine grids and intensity adjustments while preventing anatomical flips.
-    """
-
     def __init__(self, p_spatial: float = 0.3, p_intensity: float = 0.3):
         self.p_spatial = p_spatial
         self.p_intensity = p_intensity
@@ -162,10 +142,9 @@ class Segthor3DAugment:
     def __call__(
         self, ct_tensor: torch.Tensor, gt_one_hot: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Tensors expect shape [1, Z, H, W] or [C, Z, H, W]
         _, z_dim, h_dim, w_dim = ct_tensor.shape
 
-        # 1. Conservative 3D Spatial Scaling & Translation
+        # Spatial augmentations
         if random.random() < self.p_spatial:
             scale = random.uniform(0.95, 1.05)
             tx = random.uniform(-0.05, 0.05)
@@ -199,14 +178,13 @@ class Segthor3DAugment:
                 align_corners=False,
             ).squeeze(0)
 
-        # 2. Intensity Augmentations (Applied strictly to image tensor)
         if random.random() < self.p_intensity:
-            # Low-amplitude additive Gaussian noise
+            # Gaussian noise
             if random.random() < 0.5:
                 noise_std = random.uniform(0.005, 0.02)
                 ct_tensor = ct_tensor + torch.randn_like(ct_tensor) * noise_std
 
-            # Mild Volumetric Gamma correction
+            # Gamma adjustment
             if random.random() < 0.5:
                 gamma = random.uniform(0.9, 1.1)
                 img_min = ct_tensor.min()
@@ -216,11 +194,6 @@ class Segthor3DAugment:
                 )
 
         return ct_tensor, gt_one_hot
-
-
-# =============================================================================
-# Datasets
-# =============================================================================
 
 
 class SliceDataset(Dataset):
@@ -252,7 +225,6 @@ class SliceDataset(Dataset):
             self.valid_indices = []
             for idx, (_, gt_path) in enumerate(self.full_files):
                 if gt_path is not None:
-                    # Memory-map the .npy file to inspect data lazily without allocating RAM
                     gt_arr = np.load(gt_path, mmap_mode="r")
                     has_target_organs = np.any((gt_arr > 0) & (gt_arr <= 252))
                     if has_target_organs:
@@ -263,7 +235,6 @@ class SliceDataset(Dataset):
         if debug:
             self.valid_indices = self.valid_indices[:10]
 
-        # Initialize conservative 2D joint augmentation
         if augment and subset == "train":
             self.joint_transform = Segthor2DAugment(p_spatial=0.3, p_intensity=0.3)
         else:
@@ -427,7 +398,6 @@ class Segthor3DDataset(Dataset):
         else:
             self.files = all_ids[:10] if debug else all_ids
 
-        # Initialize conservative 3D augmentation module
         if self.augment and self.subset == "train":
             self.augmentor = Segthor3DAugment(p_spatial=0.3, p_intensity=0.3)
         else:
@@ -445,7 +415,6 @@ class Segthor3DDataset(Dataset):
         patient_id = self.files[index]
         patient_path = self.data_path / patient_id
 
-        # 1. Load CT Volume
         ct_path = patient_path / f"{patient_id}.nii.gz"
 
         if self.resample:
@@ -478,9 +447,7 @@ class Segthor3DDataset(Dataset):
             size=self.shape,
             mode="trilinear",
             align_corners=False,
-        ).squeeze(
-            0
-        )  # Shape: [1, 128, 256, 256]
+        ).squeeze(0)
 
         data_dict = {
             "images": ct_resized,
@@ -489,7 +456,6 @@ class Segthor3DDataset(Dataset):
             "orig_shape": torch.tensor(orig_shape),
         }
 
-        # 2. Load Ground Truth
         if not self.test_mode:
             gt_path = patient_path / "GT.nii.gz"
 
@@ -521,7 +487,6 @@ class Segthor3DDataset(Dataset):
             gt_one_hot = torch.nn.functional.one_hot(gt_resized, num_classes=5)
             gt_one_hot = gt_one_hot.permute(3, 0, 1, 2).float()
 
-            # --- 3D AUGMENTATIONS ---
             if self.augmentor is not None:
                 ct_resized, gt_one_hot = self.augmentor(ct_resized, gt_one_hot)
 

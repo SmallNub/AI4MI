@@ -149,7 +149,11 @@ def save_boxplot(
     if model_order is not None:
         missing_models = set(available_models) - set(model_order)
         unknown_models = set(model_order) - set(available_models)
-        if missing_models or unknown_models or len(model_order) != len(available_models):
+        if (
+            missing_models
+            or unknown_models
+            or len(model_order) != len(available_models)
+        ):
             raise ValueError(
                 "--model-order must list each model ID exactly once. "
                 f"Missing: {sorted(missing_models)}; "

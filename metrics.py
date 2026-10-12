@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 
-"""3D segmentation metrics for reconstructed NIfTI volumes across multiple patients."""
-
 from __future__ import annotations
 
 import re
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Match, Pattern
+from typing import Pattern
 
 import torch
 import distorch

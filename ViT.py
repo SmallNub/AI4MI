@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 
 from typing import Tuple, Union
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# =====================================================================
-# Utilities & Normalization
-# =====================================================================
-
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching channel divisibility."""
     effective_max = min(max_groups, max(1, num_channels // 2))
     for g in [32, 16, 8, 4, 2]:
         if g <= effective_max and num_channels % g == 0:
@@ -33,7 +27,6 @@ def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tens
 
 
 class DropPath(nn.Module):
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -43,7 +36,6 @@ class DropPath(nn.Module):
 
 
 def model_weights_init(m: nn.Module) -> None:
-    """Weight initialization matching Vision Transformer conventions."""
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
         nn.init.trunc_normal_(m.weight, std=0.02)
         if m.bias is not None:
@@ -53,11 +45,6 @@ def model_weights_init(m: nn.Module) -> None:
             nn.init.ones_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-
-
-# =====================================================================
-# Vision Transformer Modules
-# =====================================================================
 
 
 class SqueezeExcite(nn.Module):
@@ -79,7 +66,7 @@ class SqueezeExcite(nn.Module):
 
 
 class SpatialAttention2D(nn.Module):
-    """Spatial Reduction Attention (SRA) for high-resolution feature maps."""
+    """Spatial Reduction Attention (SRA)."""
 
     def __init__(self, dim: int, num_heads: int = 4, sr_ratio: int = 2):
         super().__init__()
@@ -124,7 +111,6 @@ class SpatialAttention2D(nn.Module):
 
         k, v = kv[0], kv[1]
 
-        # Memory-efficient attention
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, N, C)
         out = self.proj(out)
@@ -146,7 +132,7 @@ class MLP2D(nn.Module):
 
 
 class ViTBlock(nn.Module):
-    """Vision Transformer Block replacing ConvNeXt Block with MHSA + FeedForward MLP."""
+    """Vision Transformer Block."""
 
     def __init__(
         self,
@@ -236,8 +222,8 @@ class SpatialAttentionGate(nn.Module):
         return x * alpha
 
 
-class LiteDepthwiseASPPModule(nn.Module):
-    """Lite Atrous Spatial Pyramid Pooling module using additive feature fusion."""
+class ASPPModule(nn.Module):
+    """Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
@@ -302,11 +288,6 @@ class LiteDepthwiseASPPModule(nn.Module):
         return self.project(fused)
 
 
-# =====================================================================
-# Decoder Block
-# =====================================================================
-
-
 class UpDecoderBlock(nn.Module):
     """Attention-Gated Decoder Block with Skip Fusion and Transformer Refinement."""
 
@@ -342,13 +323,8 @@ class UpDecoderBlock(nn.Module):
         return self.spatial(reduced)
 
 
-# =====================================================================
-# Main Architecture: ViT_ImprovedENet
-# =====================================================================
-
-
 class ViT(nn.Module):
-    """Vision Transformer (ViT-UNet) counterpart to ImprovedENet using 2D MHSA blocks."""
+    """Vision Transformer."""
 
     def __init__(
         self,
@@ -369,7 +345,7 @@ class ViT(nn.Module):
             ViTBlock(K, K, stride=1, drop_path_rate=0.0),
         )
 
-        # Encoder Path (Hierarchical Vision Transformer)
+        # Encoder Path
         self.enc1 = ViTBlock(
             K, K * 2, stride=2, num_heads=2, drop_path_rate=drop_rate * 0.2
         )
@@ -392,9 +368,9 @@ class ViT(nn.Module):
             ),
         )
 
-        # Bottleneck (ASPP + Global ViT Attention)
+        # Bottleneck
         self.bottleneck = nn.Sequential(
-            LiteDepthwiseASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
+            ASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
             ViTBlock(
                 K * 8, K * 8, stride=1, num_heads=8, drop_path_rate=bottleneck_drop_rate
             ),

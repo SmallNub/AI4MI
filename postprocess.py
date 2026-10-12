@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-"""
-Universal Post-Processing & Spatial Remapping Pipeline
-------------------------------------------------------
-1. Stitches 2D slice predictions (.png / .npy) or reads 3D model predictions in preprocessed space.
-2. If post-processing is enabled:
-   - Evaluates all candidate removal-only 3D post-processing policies against Ground Truth (if provided) using Mean Dice Score.
-   - Selects the best-performing policy and applies it.
-3. Maps predictions back to the preprocessed CT NIfTI header/affine.
-4. Resamples the segmentation back to the original raw CT physical space using SimpleITK.
-"""
 
 import argparse
-import csv
 import json
 import re
-import shutil
-from collections import defaultdict
 from copy import deepcopy
 from functools import partial
 from multiprocessing import Pool
@@ -30,10 +17,6 @@ from skimage.io import imread
 from skimage.transform import resize
 from tqdm import tqdm
 
-# ==============================================================================
-# 1. ORGAN-SPECIFIC 3D POST-PROCESSING & POLICIES
-# ==============================================================================
-
 LABELS = {1: "esophagus", 2: "heart", 3: "trachea", 4: "aorta"}
 POLICY_FIELDS = {
     "enabled",
@@ -45,7 +28,7 @@ POLICY_FIELDS = {
     "slice_connectivity",
 }
 
-# Base policy: no changes.
+# Base policy
 BASE_POLICY: Dict[str, Dict[str, Any]] = {
     str(label): {
         "enabled": False,
@@ -164,7 +147,9 @@ def validate_policy(policy_by_label: Dict[str, Dict[str, Any]]) -> None:
     for label, policy in policy_by_label.items():
         unknown = set(policy) - POLICY_FIELDS
         if unknown:
-            raise ValueError(f"unknown policy fields for label {label}: {sorted(unknown)}")
+            raise ValueError(
+                f"unknown policy fields for label {label}: {sorted(unknown)}"
+            )
         if int(policy["connectivity"]) not in (1, 2, 3):
             raise ValueError(f"Label {label}: connectivity must be 1, 2 or 3")
         if int(policy["slice_connectivity"]) not in (1, 2):
@@ -235,9 +220,7 @@ def apply_policy(
         keep_ids = np.intersect1d(keep_ids, relative_ids)
 
     cleaned = np.isin(labelled, keep_ids)
-    report["removed_by_3d_filter_voxels"] = int(
-        np.logical_and(mask, ~cleaned).sum()
-    )
+    report["removed_by_3d_filter_voxels"] = int(np.logical_and(mask, ~cleaned).sum())
 
     slice_axis = policy["slice_lcc_axis"]
     if slice_axis is not None:
@@ -351,9 +334,6 @@ def load_policy(
     return policy
 
 
-# ==============================================================================
-# 2. EVALUATION METRICS
-# ==============================================================================
 def compute_dice_score(
     pred: np.ndarray, gt: np.ndarray, labels: List[int] = [1, 2, 3, 4]
 ) -> Dict[int, float]:
@@ -419,7 +399,7 @@ def evaluate_policies(
                 }
             )
         else:
-            # Evaluation without Ground Truth (e.g., component count & noise filtering ratio)
+            # Evaluation without Ground Truth
             total_removed = sum(r.get("removed_voxels", 0) for r in records)
             total_input = sum(r.get("input_voxels", 1) for r in records) or 1
             removal_ratio = total_removed / total_input
@@ -457,7 +437,9 @@ def load_patient_prediction(
     """Load one patient prediction in the preprocessed reference geometry."""
     prep_nii_path = Path(preprocessed_scan_pattern.format(id_=patient_id))
     if not prep_nii_path.exists():
-        raise FileNotFoundError(f"Preprocessed reference NIfTI not found: {prep_nii_path}")
+        raise FileNotFoundError(
+            f"Preprocessed reference NIfTI not found: {prep_nii_path}"
+        )
 
     reference = nib.load(str(prep_nii_path))
     X, Y, Z = reference.shape
@@ -480,8 +462,14 @@ def load_patient_prediction(
         for slice_path in slice_files:
             z = get_z_index(slice_path)
             if not 0 <= z < Z:
-                raise ValueError(f"Slice index {z} out of bounds for {patient_id} (Z={Z})")
-            img_arr = np.load(slice_path) if slice_path.suffix == ".npy" else imread(slice_path)
+                raise ValueError(
+                    f"Slice index {z} out of bounds for {patient_id} (Z={Z})"
+                )
+            img_arr = (
+                np.load(slice_path)
+                if slice_path.suffix == ".npy"
+                else imread(slice_path)
+            )
             if img_arr.max() > num_classes:
                 img_arr = (img_arr // 63).astype(np.uint8)
             if img_arr.shape != (X, Y):
@@ -523,9 +511,7 @@ def select_global_policy(
     if not patient_ids:
         raise ValueError("No patients available for global policy evaluation")
 
-    preset_scores: Dict[str, List[float]] = {
-        preset: [] for preset in BUILTIN_POLICIES
-    }
+    preset_scores: Dict[str, List[float]] = {preset: [] for preset in BUILTIN_POLICIES}
     class_scores: Dict[str, Dict[int, List[float]]] = {
         preset: {class_id: [] for class_id in label_order}
         for preset in BUILTIN_POLICIES
@@ -541,7 +527,9 @@ def select_global_policy(
         )
         gt_path = Path(gt_scan_pattern.format(id_=patient_id))
         if not gt_path.exists():
-            raise FileNotFoundError(f"Ground truth not found for {patient_id}: {gt_path}")
+            raise FileNotFoundError(
+                f"Ground truth not found for {patient_id}: {gt_path}"
+            )
         target = np.asarray(nib.load(str(gt_path)).dataobj, dtype=np.uint8)
         if target.shape != prediction.shape:
             raise ValueError(
@@ -588,9 +576,6 @@ def select_global_policy(
     }
 
 
-# ==============================================================================
-# 3. HELPER FUNCTIONS
-# ==============================================================================
 def get_z_index(filepath: Path) -> int:
     """Extracts axial slice integer z-index from file name."""
     match = re.search(r"_(\d+)\.[^.]+$", filepath.name)
@@ -618,9 +603,6 @@ def resample_mask_to_raw_ct(
     sitk.WriteImage(sitk.Cast(resampled, sitk.sitkUInt8), str(output_path))
 
 
-# ==============================================================================
-# 4. 2D & 3D PATIENT MERGING PIPELINE
-# ==============================================================================
 def process_patient(
     patient_id: str,
     pred_dir: Path,
@@ -636,7 +618,6 @@ def process_patient(
     label_order: Optional[List[int]] = None,
     selected_policy: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
-    # 1. Load Preprocessed Reference Volume (X, Y, Z) via Nibabel
     try:
         orig_nib, res_arr = load_patient_prediction(
             patient_id,
@@ -651,7 +632,7 @@ def process_patient(
 
     out_nii_path = output_dir / f"{patient_id}.nii.gz"
 
-    # 2. Evaluate & Apply Post-Processing Policies
+    # Evaluate & Apply Post-Processing Policies
     if apply_post:
         spacing = tuple(float(v) for v in orig_nib.header.get_zooms()[:3])
         policy = selected_policy or load_policy(preset, config_path)
@@ -662,13 +643,13 @@ def process_patient(
             label_order=label_order or [1, 2, 3, 4],
         )
 
-    # 3. Save initial volume using preprocessed affine matrix & header
+    # Save initial volume using preprocessed affine matrix & header
     new_nib = nib.nifti1.Nifti1Image(
         res_arr, affine=orig_nib.affine, header=orig_nib.header
     )
     nib.save(new_nib, str(out_nii_path))
 
-    # 4. Physical Resampling to Raw Scan Space
+    # Physical Resampling to Raw Scan Space
     raw_ct_path = Path(raw_scan_pattern.format(id_=patient_id))
     if not raw_ct_path.exists():
         print(
@@ -676,13 +657,9 @@ def process_patient(
         )
         return
 
-    # Resample from preprocessed physical space back to raw physical space
     resample_mask_to_raw_ct(out_nii_path, raw_ct_path, out_nii_path)
 
 
-# ==============================================================================
-# MAIN CLI ENTRYPOINT
-# ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Universal post-processing and raw physical resampling pipeline."
@@ -789,7 +766,9 @@ def main():
     if args.evaluate_all_policies and args.policy_selection:
         parser.error("Use either --evaluate_all_policies or --policy-selection")
     if args.policy_selection and args.config:
-        parser.error("--policy-selection already contains a complete policy; omit --config")
+        parser.error(
+            "--policy-selection already contains a complete policy; omit --config"
+        )
 
     args.dest_folder.mkdir(parents=True, exist_ok=True)
 

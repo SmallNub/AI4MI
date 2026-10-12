@@ -10,7 +10,6 @@ from typing import Any
 import torch
 import numpy as np
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset import SliceDataset
@@ -43,7 +42,7 @@ def img_transform(img):
 
 def gt_transform(K, img):
     img = np.array(img)[...]
-    img = img / (255 / (K - 1)) if K != 5 else img / 63  # max <= 1
+    img = img / (255 / (K - 1)) if K != 5 else img / 63
     img = torch.tensor(img, dtype=torch.int64)[None, ...]
     img = class2one_hot(img, K=K)
     return img[0]
@@ -60,7 +59,7 @@ def run_inference(args):
     factor: int = config.get("factor", 2)
     B: int = config["B"]
 
-    # Load weights or full model
+    # Load weights
     weights_path = Path(args.weights)
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights file not found at {weights_path}")
@@ -74,7 +73,9 @@ def run_inference(args):
     else:
         net = torch.load(weights_path, map_location=device, weights_only=False)
         if not hasattr(net, "conv0") or not hasattr(net.conv0, "in_channels"):
-            raise ValueError("Pickled model must expose conv0.in_channels for slice context")
+            raise ValueError(
+                "Pickled model must expose conv0.in_channels for slice context"
+            )
         z_window = int(net.conv0.in_channels)
         if z_window % 2 == 0:
             raise ValueError(f"Expected an odd slice window, found {z_window}")
@@ -108,20 +109,18 @@ def run_inference(args):
         for data in tqdm_(loader, desc=f">> Inference ({args.split})"):
             img = data["images"].to(device)
 
-            # Adapt input dimensions for 3D networks if input is 2D slice (B, C, H, W) -> (B, C, 1, H, W)
-            is_input_2d = (img.ndim == 4)
+            # Adapt input dimensions for 3D networks
+            is_input_2d = img.ndim == 4
             if args.is_3d and is_input_2d:
-                img = img.unsqueeze(2)  # Add Depth dimension: (B, C, 1, H, W)
+                img = img.unsqueeze(2)
 
             pred_logits = net(img)
-            pred_probs = F.softmax(pred_logits, dim=1)  # softmax along class dimension
+            pred_probs = F.softmax(pred_logits, dim=1)
 
-            # Class index map across channels (works for both 4D and 5D tensors)
             predicted_class = probs2class(pred_probs)
 
             # Squeeze extra depth dimension if network returned 3D with D=1
             if predicted_class.ndim == 4 and is_input_2d:
-                # Shape is (B, 1, H, W) -> squeeze out depth dimension 1
                 predicted_class = predicted_class.squeeze(1)
 
             # Save 2D outputs
@@ -136,7 +135,7 @@ def run_inference(args):
             elif predicted_class.ndim == 4:  # Batch of 3D volumes: (B, D, H, W)
                 # Unroll 3D volume into individual slice PNGs
                 for b, stem in enumerate(data["stems"]):
-                    vol_pred = predicted_class[b]  # (D, H, W)
+                    vol_pred = predicted_class[b]
                     for d_idx in range(vol_pred.shape[0]):
                         slice_stem = f"{stem}_{d_idx:04d}"
                         with warnings.catch_warnings():
@@ -151,7 +150,9 @@ def run_inference(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference script supporting 2D and 3D models")
+    parser = argparse.ArgumentParser(
+        description="Inference script supporting 2D and 3D models"
+    )
 
     parser.add_argument(
         "--weights",

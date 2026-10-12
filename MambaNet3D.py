@@ -12,13 +12,8 @@ try:
 except ImportError:
     Mamba = None
 
-# =====================================================================
-# Utilities & Normalization
-# =====================================================================
-
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching channel divisibility."""
     effective_max = min(max_groups, max(1, num_channels // 2))
     for g in [32, 16, 8, 4, 2]:
         if g <= effective_max and num_channels % g == 0:
@@ -38,7 +33,6 @@ def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tens
 
 
 class DropPath(nn.Module):
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -48,7 +42,6 @@ class DropPath(nn.Module):
 
 
 def model_weights_init_3d(m: nn.Module) -> None:
-    """Weight initialization for 3D ConvNeXt & SSM modules."""
     if isinstance(m, (nn.Conv3d, nn.ConvTranspose3d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -56,11 +49,6 @@ def model_weights_init_3d(m: nn.Module) -> None:
     elif isinstance(m, (nn.GroupNorm, nn.BatchNorm3d, nn.LayerNorm)):
         nn.init.ones_(m.weight)
         nn.init.zeros_(m.bias)
-
-
-# =====================================================================
-# Memory-Optimized 3D ConvNeXt & Attention Modules
-# =====================================================================
 
 
 class SqueezeExcite3D(nn.Module):
@@ -90,7 +78,7 @@ class ConvNeXtBlock3D(nn.Module):
         out_dim: int,
         kernel_size: int = 7,
         stride: int = 1,
-        expand_ratio: int = 2,  # Reduced default expansion ratio from 4 to 2 to save VRAM
+        expand_ratio: int = 2,
         drop_path_rate: float = 0.0,
         layer_scale_init: float = 1e-6,
     ):
@@ -175,8 +163,8 @@ class SpatialAttentionGate3D(nn.Module):
         return x * alpha
 
 
-class LiteDepthwiseASPPModule3D(nn.Module):
-    """Memory-efficient 3D Atrous Spatial Pyramid Pooling module using additive fusion."""
+class ASPPModule3D(nn.Module):
+    """3D Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
@@ -225,7 +213,7 @@ class LiteDepthwiseASPPModule3D(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         d, h, w = x.shape[2:]
-        # Accumulate branch outputs directly to avoid allocating a large concatenated tensor
+
         fused = self.branches[0](x)
         for branch in self.branches[1:]:
             fused = fused + branch(x)
@@ -237,16 +225,8 @@ class LiteDepthwiseASPPModule3D(nn.Module):
         return self.project(fused)
 
 
-# =====================================================================
-# Optimized 3D Cross-Scan Mamba Module
-# =====================================================================
-
-
 class Mamba3DBlock(nn.Module):
-    """Batched 6-Directional 3D Volumetric Cross-Scanning SSM Block with Additive Fusion.
-
-    Eliminates high-dimensional 6x channel concatenation to cut peak activation memory by ~80%.
-    """
+    """6-Directional 3D Volumetric Mamba Block."""
 
     def __init__(
         self,
@@ -272,7 +252,7 @@ class Mamba3DBlock(nn.Module):
             is_mimo=False,
         )
 
-        # Lightweight directional weighting instead of 6*dim projection layer
+        # Lightweight directional weighting
         self.dir_weights = nn.Parameter(torch.ones(6) / 6.0)
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
@@ -298,7 +278,7 @@ class Mamba3DBlock(nn.Module):
         x5 = x_norm.permute(0, 4, 2, 3, 1).contiguous().view(B, L, C)
         x6 = torch.flip(x5, dims=[1])
 
-        # Batch 6 directions into a single SSM pass
+        # Batch 6 directions into a single pass
         xs = torch.cat([x1, x2, x3, x4, x5, x6], dim=0)
         ys = self.mamba_call(xs)
 
@@ -314,17 +294,12 @@ class Mamba3DBlock(nn.Module):
         y5 = y5.view(B, W, D, H, C).permute(0, 2, 3, 1, 4)
         y6 = torch.flip(y6, dims=[1]).view(B, W, D, H, C).permute(0, 2, 3, 1, 4)
 
-        # Weighted additive directional aggregation (Avoids creating a 6*C intermediate tensor)
+        # Weighted additions
         w = F.softmax(self.dir_weights, dim=0)
         merged = w[0] * y1 + w[1] * y2 + w[2] * y3 + w[3] * y4 + w[4] * y5 + w[5] * y6
 
         mamba_out = merged.permute(0, 4, 1, 2, 3)
         return x + self.drop_path(mamba_out)
-
-
-# =====================================================================
-# 3D Decoder Block
-# =====================================================================
 
 
 class UpDecoderBlock3D(nn.Module):
@@ -372,13 +347,8 @@ class UpDecoderBlock3D(nn.Module):
         return self.spatial(reduced)
 
 
-# =====================================================================
-# Main Architecture: MambaNet3D
-# =====================================================================
-
-
 class MambaNet3D(nn.Module):
-    """Hybrid Mamba-ConvNeXt 3D Volumetric Architecture [B, C, D, H, W]."""
+    """Hybrid Mamba/ConvNeXt 3D Architecture."""
 
     def __init__(
         self,
@@ -438,9 +408,9 @@ class MambaNet3D(nn.Module):
             ),
         )
 
-        # Bottleneck: Lite-ASPP3D + 3D Mamba
+        # Bottleneck
         self.bottleneck = nn.Sequential(
-            LiteDepthwiseASPPModule3D(K * 8, K * 8, rates=(1, 3, 6)),
+            ASPPModule3D(K * 8, K * 8, rates=(1, 3, 6)),
             Mamba3DBlock(
                 dim=K * 8,
                 drop_path_rate=bottleneck_drop_rate,

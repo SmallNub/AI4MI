@@ -32,140 +32,12 @@ import numpy as np
 import nibabel as nib
 from skimage.io import imread
 from skimage.transform import resize
-from scipy.ndimage import (
-    label,
-    binary_closing,
-    binary_fill_holes,
-    generate_binary_structure,
-)
 
 from utils import tqdm_
 
 
 def get_z(image: Path) -> int:
     return int(image.stem.split("_")[-1])
-
-
-def post_process_3d(
-    arr: np.ndarray,
-    num_classes: int = 5,
-    crop_z_margins: bool = False,
-) -> np.ndarray:
-    """
-    Organ-specific 3D post-processing tailored for axial CT volumes.
-    Iterates sequentially through class indices 1 to 4.
-    Input shape expected: (H, W, Z) where Z is the axial slice index.
-    
-    Classes:
-        1: Esophagus
-        2: Heart
-        3: Trachea
-        4: Aorta
-    """
-    cleaned_arr = np.zeros_like(arr)
-    struct_3d_26 = generate_binary_structure(3, 3)
-    struct_2d_8 = generate_binary_structure(2, 2)
-
-    H, W, Z = arr.shape
-    z_min, z_max = 0, Z
-    if crop_z_margins:
-        z_min = int(Z * 0.05)
-        z_max = int(Z * 0.95)
-
-    # Process sequentially by class index (1: Esophagus, 2: Heart, 3: Trachea, 4: Aorta)
-    for c in range(1, num_classes):
-        mask = arr[:, :, z_min:z_max] == c
-        if not mask.any():
-            continue
-
-        # -------------------------------------------------------------
-        # Class 1: Esophagus (Thin vertical structure across axial slices)
-        # -------------------------------------------------------------
-        if c == 1:
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-
-                # Filter small noise artifacts while keeping largest valid components
-                valid_labels = np.where(sizes >= 250)[0]
-                if len(valid_labels) > 0:
-                    mask = np.isin(labeled_mask, valid_labels)
-                else:
-                    mask = labeled_mask == np.argmax(sizes)
-
-            # Bridge axial Z-axis gaps (up to 2-3 missing slices vertically)
-            z_gap_kernel = np.zeros((1, 1, 5), dtype=bool)
-            z_gap_kernel[0, 0, :] = True
-            mask = binary_closing(mask, structure=z_gap_kernel)
-
-        # -------------------------------------------------------------
-        # Class 2: Heart (Large compact structure)
-        # -------------------------------------------------------------
-        elif c == 2:
-            # 2D hole filling on each axial slice
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
-
-            # 3D closing to smooth volumetric boundaries
-            mask = binary_closing(mask, structure=struct_3d_26, iterations=2)
-
-            # Keep only the single largest contiguous component
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                mask = labeled_mask == np.argmax(sizes)
-
-        # -------------------------------------------------------------
-        # Class 3: Trachea (Continuous central airway)
-        # -------------------------------------------------------------
-        elif c == 3:
-            # 2D slice-wise hole filling (airway lumen)
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    mask[:, :, z] = binary_fill_holes(mask[:, :, z])
-
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-                # Retain the largest component to prevent empty predictions (prevents inf HD95)
-                mask = labeled_mask == np.argmax(sizes)
-
-            # Close minor Z-axis gaps between slices
-            z_kernel = np.zeros((1, 1, 3), dtype=bool)
-            z_kernel[0, 0, :] = True
-            mask = binary_closing(mask, structure=z_kernel)
-
-        # -------------------------------------------------------------
-        # Class 4: Aorta (Ascending/Descending tubular sections)
-        # -------------------------------------------------------------
-        elif c == 4:
-            # Enforce solid cross-sections per axial slice
-            for z in range(mask.shape[2]):
-                if mask[:, :, z].any():
-                    slice_2d = binary_closing(mask[:, :, z], structure=struct_2d_8, iterations=1)
-                    mask[:, :, z] = binary_fill_holes(slice_2d)
-
-            labeled_mask, num_features = label(mask, structure=struct_3d_26)
-            if num_features > 0:
-                sizes = np.bincount(labeled_mask.ravel())
-                sizes[0] = 0
-
-                # Retain primary components (> 1500 voxels) to keep both arch & descending sections
-                valid_labels = np.where(sizes >= 1500)[0]
-                if len(valid_labels) > 0:
-                    mask = np.isin(labeled_mask, valid_labels)
-                else:
-                    mask = labeled_mask == np.argmax(sizes)
-
-        # Prevent overwriting previously assigned voxel space
-        empty_space = cleaned_arr[:, :, z_min:z_max] == 0
-        cleaned_arr[:, :, z_min:z_max][mask & empty_space] = c
-
-    return cleaned_arr
 
 
 def merge_patient(
@@ -215,10 +87,6 @@ def merge_patient(
     assert set(np.unique(res_arr)).issubset(
         set(range(5))
     ), f"Found unexpected class values: {np.unique(res_arr)}"
-
-    # Apply enhanced 3D post-processing
-    if post_process:
-        res_arr = post_process_3d(res_arr, num_classes=5)
 
     new_nib = nib.nifti1.Nifti1Image(
         res_arr, affine=orig_nib.affine, header=orig_nib.header
@@ -278,12 +146,6 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--dest_folder", type=Path, required=True)
     parser.add_argument("--grp_regex", type=str, required=True)
     parser.add_argument("--num_classes", type=int, default=5)
-    parser.add_argument(
-        "--post",
-        action="store_true",
-        default=False,
-        help="Enable 3D connected component post-processing",
-    )
 
     args = parser.parse_args()
     print(args)

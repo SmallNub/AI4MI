@@ -1,12 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=pipeline_mam
-#SBATCH --output=scripts/slurm/pipeline_mam%j.log
-#SBATCH --error=scripts/slurm/pipeline_mam%j.err
+#SBATCH --job-name=preprocess
+#SBATCH --output=scripts/slurm/preprocess%j.log
+#SBATCH --error=scripts/slurm/preprocess%j.err
 #SBATCH --time=00:15:00
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=rome
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gpus=1
+#SBATCH --ntasks=16
 
 module purge
 module load 2024

@@ -50,13 +50,13 @@ from torchinfo import summary
 
 from dataset import SliceDataset, Segthor3DDataset
 from ShallowNet import shallowCNN
-from ENet import ENet, AttentionENet, SpatialENet, CBAMENet, LateFusionENet
+from ENet import ENet, AttentionENet, SpatialENet, CBAMENet
 from MambaNet import MambaNet
 from MambaNet3D import MambaNet3D
-from ImprovedENet import ImprovedENet
-from ImprovedENet3D import ImprovedENet3D
-from ENet3D import ENet3D, AttentionENet3D
-from ENet3D_old import ENet3D as ENet3D_old
+from CustomUNet import CustomUNet
+from CustomUNet3D import CustomUNet3D
+from AttentionENet3D import ENet3D, AttentionENet3D
+from ENet3D import ENet3D as ENet3D_old
 from ViT import ViT
 from utils import (
     Dcm,
@@ -79,11 +79,13 @@ datasets_params["SEGTHOR_processed"] = {"K": 5, "B": 8}
 datasets_params["segthor_train_full"] = {"K": 5, "B": 4}
 datasets_params["segthor_processed"] = {"K": 5, "B": 4}
 
-
 models_params: dict[str, dict[str, Any]] = {}
 models_params["shallowCNN"] = {"net": shallowCNN, "args": {"kernels": 8, "factor": 2}}
 models_params["ENet"] = {"net": ENet, "args": {"kernels": 8, "factor": 2}}
-models_params["ENet25D"] = {"net": ENet, "args": {"kernels": 8, "factor": 2, "z_window": 15}}
+models_params["ENet25D"] = {
+    "net": ENet,
+    "args": {"kernels": 8, "factor": 2, "z_window": 15},
+}
 models_params["AttentionENet"] = {
     "net": AttentionENet,
     "args": {"kernels": 8, "factor": 2},
@@ -96,20 +98,16 @@ models_params["CBAMENet"] = {
     "net": CBAMENet,
     "args": {"kernels": 8, "factor": 2},
 }
-models_params["LateFusionENet"] = {
-    "net": LateFusionENet,
-    "args": {"kernels": 8, "factor": 2, "z_window": 5},
-}
-models_params["ImprovedENet"] = {
-    "net": ImprovedENet,
+models_params["CustomUNet"] = {
+    "net": CustomUNet,
     "args": {"kernels": 8, "z_window": 15},
 }
 models_params["ViT"] = {
     "net": ViT,
     "args": {"kernels": 8, "z_window": 15},
 }
-models_params["ImprovedENet3D"] = {
-    "net": ImprovedENet3D,
+models_params["CustomUNet3D"] = {
+    "net": CustomUNet3D,
     "args": {"kernels": 16},
 }
 models_params["MambaNet"] = {
@@ -212,7 +210,7 @@ def setup(
     bool,
     torch.memory_format | None,
 ]:
-    # Delete existing target folder to avoid saving artifacts or state collisions
+    # Delete existing target folder to avoid saving artifacts
     if args.dest.exists():
         print(f">> Removing existing output directory: {args.dest}")
         rmtree(args.dest)
@@ -478,7 +476,7 @@ def runTraining(args):
                         pred_probs = F.softmax(1 * pred_logits, dim=1)
                         loss_main, *loss_info = loss_fn(pred_probs, gt)
 
-                        # Combine main and auxiliary loss (0.4 weighting factor for Deep Supervision)
+                        # Combine main and auxiliary loss
                         if is_3d_model:
                             loss = (
                                 loss_main + 0.1 * loss_aux

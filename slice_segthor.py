@@ -42,7 +42,7 @@ def norm_arr(
 ) -> np.ndarray:
     casted = ct.astype(np.float32)
 
-    # Soft Tissue / Mediastinum HU Clipping (-160 HU to +240 HU)
+    # Soft Tissue / Mediastinum HU Clipping
     min_hu = window_center - (window_width / 2.0)
     max_hu = window_center + (window_width / 2.0)
     clipped = np.clip(casted, min_hu, max_hu)
@@ -123,7 +123,7 @@ def slice_patient(
     else:
         gt = np.zeros_like(ct, dtype=np.uint8)
 
-    # Skip normalization step if already preprocessed by the NIfTI script
+    # Skip normalization step if already preprocessed by the preprocess script
     to_slice_ct = ct.astype(np.float32) if skip_preprocessing else norm_arr(ct)
     to_slice_gt = gt
 

@@ -34,7 +34,6 @@ echo "Training..."
 python -O main.py \
     --model ViT \
     --loss compound \
-    --use_focal \
     --batch_size 32 \
     --clip-grad 1.0 \
     --lr 0.001 \

@@ -11,13 +11,8 @@ try:
 except ImportError:
     Mamba = None
 
-# =====================================================================
-# Utilities & Normalization
-# =====================================================================
-
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching channel divisibility."""
     effective_max = min(max_groups, max(1, num_channels // 2))
     for g in [32, 16, 8, 4, 2]:
         if g <= effective_max and num_channels % g == 0:
@@ -37,7 +32,6 @@ def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tens
 
 
 class DropPath(nn.Module):
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -47,7 +41,6 @@ class DropPath(nn.Module):
 
 
 def model_weights_init(m: nn.Module) -> None:
-    """Weight initialization matching ImprovedENet & MambaNet."""
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -57,11 +50,6 @@ def model_weights_init(m: nn.Module) -> None:
             nn.init.ones_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-
-
-# =====================================================================
-# ConvNeXt & Attention Modules
-# =====================================================================
 
 
 class SqueezeExcite(nn.Module):
@@ -163,8 +151,8 @@ class SpatialAttentionGate(nn.Module):
         return x * alpha
 
 
-class LiteDepthwiseASPPModule(nn.Module):
-    """Lite Atrous Spatial Pyramid Pooling module using additive feature fusion."""
+class ASPPModule(nn.Module):
+    """Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
@@ -229,17 +217,8 @@ class LiteDepthwiseASPPModule(nn.Module):
         return self.project(fused)
 
 
-# =====================================================================
-# Optimized 2D Cross-Scan Mamba Module
-# =====================================================================
-
-
 class Mamba2DBlock(nn.Module):
-    """Batched 4-Directional 2D Spatial Cross-Scanning SSM Block.
-
-    Executes all 4 spatial scanning directions in a SINGLE batched SSM kernel
-    pass [4*B, L, C] to maximize GPU occupancy and eliminate launch overhead.
-    """
+    """4-Directional 2D Mamba Block."""
 
     def __init__(
         self,
@@ -278,9 +257,8 @@ class Mamba2DBlock(nn.Module):
         B, C, H, W = x.shape
         L = H * W
 
-        # Preserve channels_last layout efficiency
+        # Preserve channels_last layout
         if x.is_contiguous(memory_format=torch.channels_last):
-            # Memory layout is already (B, H, W, C) physically
             x_norm = self.norm(
                 x.to(memory_format=torch.contiguous_format).permute(0, 2, 3, 1)
             )
@@ -288,18 +266,13 @@ class Mamba2DBlock(nn.Module):
             x_norm = self.norm(x.permute(0, 2, 3, 1).contiguous())
 
         # Construct 4 directional scan sequences
-        # 1. Horizontal Forward
-        x1 = x_norm.view(B, L, C)
-        # 2. Horizontal Backward
-        x2 = torch.flip(x1, dims=[1])
-        # 3. Vertical Forward
-        x3 = x_norm.permute(0, 2, 1, 3).contiguous().view(B, L, C)
-        # 4. Vertical Backward
-        x4 = torch.flip(x3, dims=[1])
+        x1 = x_norm.view(B, L, C)  # Horizontal Forward
+        x2 = torch.flip(x1, dims=[1])  # Horizontal Backward
+        x3 = x_norm.permute(0, 2, 1, 3).contiguous().view(B, L, C)  # Vertical Forward
+        x4 = torch.flip(x3, dims=[1])  # Vertical Backward
 
-        # Batch all 4 directions together [4*B, L, C] for a single kernel pass
+        # Batch all 4 directions for a single kernel pass
         xs = torch.cat([x1, x2, x3, x4], dim=0)
-
         ys = self.mamba_call(xs)
 
         # Split outputs back to 4 streams
@@ -316,11 +289,6 @@ class Mamba2DBlock(nn.Module):
         mamba_out = self.proj(merged).permute(0, 3, 1, 2)
 
         return x + self.drop_path(mamba_out)
-
-
-# =====================================================================
-# Decoder Block
-# =====================================================================
 
 
 class UpDecoderBlock(nn.Module):
@@ -362,13 +330,8 @@ class UpDecoderBlock(nn.Module):
         return self.spatial(reduced)
 
 
-# =====================================================================
-# Main Architecture: MambaNet
-# =====================================================================
-
-
 class MambaNet(nn.Module):
-    """Hybrid Mamba-ConvNeXt Architecture with Batched 2D Cross-Scan."""
+    """Hybrid Mamba/ConvNeXt Architecture."""
 
     def __init__(
         self,
@@ -408,9 +371,9 @@ class MambaNet(nn.Module):
             Mamba2DBlock(dim=K * 8, drop_path_rate=drop_rate * 0.6),
         )
 
-        # Bottleneck: Lite-ASPP + 2D Mamba
+        # Bottleneck
         self.bottleneck = nn.Sequential(
-            LiteDepthwiseASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
+            ASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
             Mamba2DBlock(dim=K * 8, drop_path_rate=bottleneck_drop_rate),
         )
 

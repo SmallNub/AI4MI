@@ -44,6 +44,7 @@ BASE_POLICY: dict[str, dict[str, Any]] = {
     for label in LABELS
 }
 
+
 def _with_overrides(
     policy: dict[str, dict[str, Any]], **overrides: Any
 ) -> dict[str, dict[str, Any]]:
@@ -52,6 +53,7 @@ def _with_overrides(
     for label, values in overrides.items():
         copied[label].update(values)
     return copied
+
 
 # every policy below maps to a specific literature-motivated candidate (see postprocessing.md).
 BUILTIN_POLICIES: dict[str, dict[str, dict[str, Any]]] = {
@@ -96,11 +98,11 @@ BUILTIN_POLICIES: dict[str, dict[str, dict[str, Any]]] = {
     ),
 }
 
+
 def component_statistics(
     mask: np.ndarray, connectivity: int
 ) -> tuple[np.ndarray, int, np.ndarray]:
-    """label 3D components and return labels, count and voxel counts.
-    """
+    """label 3D components and return labels, count and voxel counts."""
     if mask.ndim != 3:
         raise ValueError(f"Expected a 3D binary mask, got shape {mask.shape}")
     if connectivity not in (1, 2, 3):
@@ -112,11 +114,11 @@ def component_statistics(
     counts[0] = 0
     return labelled, n_components, counts
 
+
 def retain_largest_component_per_slice(
     mask: np.ndarray, axis: int, connectivity: int
 ) -> np.ndarray:
-    """retain largest 2D component independently in each slice.
-    """
+    """retain largest 2D component independently in each slice."""
     if mask.ndim != 3:
         raise ValueError(f"Expected a 3D binary mask, got shape {mask.shape}")
     if axis not in (0, 1, 2):
@@ -139,6 +141,7 @@ def retain_largest_component_per_slice(
 
     return np.moveaxis(result, 0, axis)
 
+
 def validate_policy(policy_by_label: dict[str, dict[str, Any]]) -> None:
     """reject malformed policy values before any prediction volume is modified."""
     if set(policy_by_label) != set(BASE_POLICY):
@@ -147,7 +150,9 @@ def validate_policy(policy_by_label: dict[str, dict[str, Any]]) -> None:
     for label, policy in policy_by_label.items():
         unknown = set(policy) - POLICY_FIELDS
         if unknown:
-            raise ValueError(f"unknown policy fields for label {label}: {sorted(unknown)}")
+            raise ValueError(
+                f"unknown policy fields for label {label}: {sorted(unknown)}"
+            )
         if int(policy["connectivity"]) not in (1, 2, 3):
             raise ValueError(f"Label {label}: connectivity must be 1, 2 or 3")
         if int(policy["slice_connectivity"]) not in (1, 2):
@@ -162,6 +167,7 @@ def validate_policy(policy_by_label: dict[str, dict[str, Any]]) -> None:
             raise ValueError(
                 f"Label {label}: min_relative_to_largest must be between 0 and 1"
             )
+
 
 def apply_policy(
     mask: np.ndarray,
@@ -221,9 +227,7 @@ def apply_policy(
         keep_ids = np.intersect1d(keep_ids, relative_ids)
 
     cleaned = np.isin(labelled, keep_ids)
-    report["removed_by_3d_filter_voxels"] = int(
-        np.logical_and(mask, ~cleaned).sum()
-    )
+    report["removed_by_3d_filter_voxels"] = int(np.logical_and(mask, ~cleaned).sum())
 
     slice_axis = policy["slice_lcc_axis"]
     if slice_axis is not None:
@@ -252,14 +256,14 @@ def apply_policy(
     )
     return cleaned.astype(bool), report
 
+
 def postprocess_volume(
     labels: np.ndarray,
     spacing: tuple[float, float, float],
     policy_by_label: dict[str, dict[str, Any]],
     label_order: list[int],
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """apply per-class policies to a 3D label map.
-    """
+    """apply per-class policies to a 3D label map."""
     if labels.ndim != 3:
         raise ValueError(f"Expected one 3D label map, got shape {labels.shape}")
 
@@ -303,11 +307,13 @@ def postprocess_volume(
 
     return output, records
 
+
 def load_policy(preset: str, config_path: Path | None) -> dict[str, dict[str, Any]]:
-    """
-    """
+    """ """
     if preset not in BUILTIN_POLICIES:
-        raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(BUILTIN_POLICIES)}")
+        raise ValueError(
+            f"Unknown preset {preset!r}; choose from {sorted(BUILTIN_POLICIES)}"
+        )
 
     policy = deepcopy(BUILTIN_POLICIES[preset])
     if config_path is None:
@@ -343,10 +349,7 @@ def write_template(path: Path) -> None:
 def main() -> None:
     """"""
     parser = argparse.ArgumentParser(
-        description=(
-            "Apply 3D post-processing "
-            "to SegTHOR NIfTI predictions."
-        )
+        description=("Apply 3D post-processing " "to SegTHOR NIfTI predictions.")
     )
     parser.add_argument(
         "--input_folder",
@@ -397,22 +400,18 @@ def main() -> None:
         return
 
     if args.input_folder is None or args.output_folder is None:
-        parser.error("--input_folder and --output_folder are required unless --write_template is used")
+        parser.error(
+            "--input_folder and --output_folder are required unless --write_template is used"
+        )
     if not args.input_folder.is_dir():
         raise FileNotFoundError(args.input_folder)
 
     search = args.input_folder.rglob if args.recursive else args.input_folder.glob
-    volumes = sorted(
-        path
-        for path in search("*.nii.gz")
-        if path.is_file()
-    )
+    volumes = sorted(path for path in search("*.nii.gz") if path.is_file())
 
     if not volumes:
         mode = "recursively below" if args.recursive else "directly inside"
-        raise FileNotFoundError(
-            f"No .nii.gz volumes found {mode} {args.input_folder}"
-        )
+        raise FileNotFoundError(f"No .nii.gz volumes found {mode} {args.input_folder}")
 
     names = [path.name for path in volumes]
     duplicate_names = sorted({name for name in names if names.count(name) > 1})
@@ -461,6 +460,6 @@ def main() -> None:
         writer.writerows(report_rows)
     print(f"Wrote audit report: {report_path}")
 
+
 if __name__ == "__main__":
     main()
-

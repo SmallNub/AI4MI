@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-Minimal SEGTHOR 3D NIfTI-to-NIfTI Processor
--------------------------------------------
-Expects input directory structured as:
-  <input_dir>/
-    <patient_id>/
-      <patient_id>.nii.gz
-      GT.nii.gz          (optional)
-
-Outputs identical structure to <output_dir> with resampled, windowed,
-and standardized NIfTI files.
-"""
 
 import argparse
 from functools import partial
@@ -26,7 +14,7 @@ from tqdm import tqdm
 def norm_sitk_image(
     image: sitk.Image, window_center: int = -200, window_width: int = 1600
 ) -> sitk.Image:
-    """Clips CT image to Soft Tissue window (-160 to +240 HU) and applies Z-score standardization."""
+    """Clips CT image to Soft Tissue window and applies Z-score standardization."""
     arr = sitk.GetArrayFromImage(image).astype(np.float32)
 
     # Soft Tissue HU Clipping
@@ -94,7 +82,7 @@ def process_patient_folder(
     )
     out_patient_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Process CT Image
+    # Process CT Image
     ct_path = patient_dir if flat_volume else patient_dir / f"{patient_id}.nii.gz"
     if ct_path.exists():
         ct_sitk = sitk.ReadImage(str(ct_path))
@@ -104,7 +92,7 @@ def process_patient_folder(
         ct_normalized = norm_sitk_image(ct_resampled)
         sitk.WriteImage(ct_normalized, str(out_patient_dir / f"{patient_id}.nii.gz"))
 
-    # 2. Process Ground Truth Mask (if present)
+    # Process Ground Truth Mask (if present)
     gt_path = None if flat_volume else patient_dir / "GT.nii.gz"
     if gt_path is not None and gt_path.exists():
         gt_sitk = sitk.ReadImage(str(gt_path))
@@ -147,7 +135,7 @@ def main():
     output_root = Path(args.output_dir)
     target_spacing = tuple(args.target_spacing)
 
-    # Find nested patient folders and flat NIfTI files (such as the test set).
+    # Find nested patient folders and flat NIfTI files
     patient_dirs = [
         p
         for p in input_root.rglob("*")

@@ -6,13 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# =====================================================================
-# Utilities & Normalization
-# =====================================================================
-
 
 def get_group_norm(num_channels: int, max_groups: int = 32) -> nn.GroupNorm:
-    """Dynamic GroupNorm matching channel divisibility."""
     effective_max = min(max_groups, max(1, num_channels // 2))
     for g in [32, 16, 8, 4, 2]:
         if g <= effective_max and num_channels % g == 0:
@@ -32,7 +27,6 @@ def drop_path(x: Tensor, drop_prob: float = 0.0, training: bool = False) -> Tens
 
 
 class DropPath(nn.Module):
-
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -42,7 +36,6 @@ class DropPath(nn.Module):
 
 
 def model_weights_init(m: nn.Module) -> None:
-    """Weight initialization matching MambaNet."""
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -52,11 +45,6 @@ def model_weights_init(m: nn.Module) -> None:
             nn.init.ones_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-
-
-# =====================================================================
-# ConvNeXt & Attention Modules
-# =====================================================================
 
 
 class SqueezeExcite(nn.Module):
@@ -158,8 +146,8 @@ class SpatialAttentionGate(nn.Module):
         return x * alpha
 
 
-class LiteDepthwiseASPPModule(nn.Module):
-    """Lite Atrous Spatial Pyramid Pooling module using additive feature fusion."""
+class ASPPModule(nn.Module):
+    """Atrous Spatial Pyramid Pooling module."""
 
     def __init__(self, in_dim: int, out_dim: int, rates: tuple = (1, 3, 6)):
         super().__init__()
@@ -224,11 +212,6 @@ class LiteDepthwiseASPPModule(nn.Module):
         return self.project(fused)
 
 
-# =====================================================================
-# Decoder Block
-# =====================================================================
-
-
 class UpDecoderBlock(nn.Module):
     """Attention-Gated Decoder Block with Skip Fusion."""
 
@@ -264,14 +247,7 @@ class UpDecoderBlock(nn.Module):
         return self.spatial(reduced)
 
 
-# =====================================================================
-# Main Architecture: ImprovedENet
-# =====================================================================
-
-
-class ImprovedENet(nn.Module):
-    """Pure CNN counterpart to MambaNet using ConvNeXt blocks in place of Mamba2D."""
-
+class CustomUNet(nn.Module):
     def __init__(
         self,
         in_dim: int = 3,
@@ -316,7 +292,7 @@ class ImprovedENet(nn.Module):
 
         # Bottleneck
         self.bottleneck = nn.Sequential(
-            LiteDepthwiseASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
+            ASPPModule(K * 8, K * 8, rates=(1, 3, 6)),
             ConvNeXtBlock(
                 K * 8, K * 8, kernel_size=7, drop_path_rate=bottleneck_drop_rate
             ),

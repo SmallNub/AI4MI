@@ -34,8 +34,6 @@ echo "Training..."
 python -O main.py \
     --model MambaNet \
     --loss compound \
-    --use_focal \
-    --dynamic_weights \
     --batch_size 32 \
     --clip-grad 1.0 \
     --lr 0.001 \

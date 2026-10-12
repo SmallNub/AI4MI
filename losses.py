@@ -131,8 +131,7 @@ class GeneralizedDice:
             )
         if pred_softmax.ndim < 4:
             raise ValueError(
-                "Generalized Dice expects [B, C, H, W] or "
-                "[B, C, D, H, W] tensors"
+                "Generalized Dice expects [B, C, H, W] or " "[B, C, D, H, W] tensors"
             )
 
         p = pred_softmax.float()
